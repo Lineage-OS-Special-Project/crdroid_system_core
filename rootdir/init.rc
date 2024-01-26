@@ -275,6 +275,9 @@ on init
     # Mount fusectl
     mount fusectl none /sys/fs/fuse/connections
 
+    # Properly mount the debugfs sys path;
+    mount -t debugfs none /sys/kernel/debug
+
     symlink /dev/binderfs/binder /dev/binder
     symlink /dev/binderfs/hwbinder /dev/hwbinder
     symlink /dev/binderfs/vndbinder /dev/vndbinder
@@ -326,12 +329,52 @@ on init
     write /proc/sys/kernel/hung_task_timeout_secs 0
     write /proc/cpu/alignment 4
 
+    # Adjust and set MQ-Deadline's fifo_batch IO scheduling nodes to 8 (instead of the default / stock value of 16) for a overall improved balance between latency and throughput;
+    write /sys/block/nullb0/queue/iosched/fifo_batch 8
+    write /sys/block/sda/queue/iosched/fifo_batch 8
+    write /sys/block/sdb/queue/iosched/fifo_batch 8
+    write /sys/block/sdc/queue/iosched/fifo_batch 8
+    write /sys/block/sdd/queue/iosched/fifo_batch 8
+    write /sys/block/sde/queue/iosched/fifo_batch 8
+
+    # Don't allow MQ-Deadline to waste or throw away important CPU clock cycles on trying to front IO merge requests calls;
+    write /sys/block/nullb0/queue/iosched/front_merges 0
+    write /sys/block/sda/queue/iosched/front_merges 0
+    write /sys/block/sdb/queue/iosched/front_merges 0 
+    write /sys/block/sdc/queue/iosched/front_merges 0
+    write /sys/block/sdd/queue/iosched/front_merges 0
+    write /sys/block/sde/queue/iosched/front_merges 0
+
+    # Reduce the total time between how often reads can happen from default 500ms down to 100ms which is a far more ideal value for systems with a lot of userspace bound interactions;
+    write /sys/block/nullb0/queue/iosched/read_expire 100
+    write /sys/block/sda/queue/iosched/read_expire 100
+    write /sys/block/sdb/queue/iosched/read_expire 100
+    write /sys/block/sdc/queue/iosched/read_expire 100
+    write /sys/block/sdd/queue/iosched/read_expire 100
+    write /sys/block/sde/queue/iosched/read_expire 100
+
+    # Set and reduce writes_starved to 1 (instead of default 2) for avoid delaying queued in-the-line writes for too long. This will slightly improve MQ-Deadline's performance in scenarios when there is pending writes coming in a massive swarm;
+    write /sys/block/nullb0/queue/iosched/writes_starved 1
+    write /sys/block/sda/queue/iosched/writes_starved 1
+    write /sys/block/sdb/queue/iosched/writes_starved 1
+    write /sys/block/sdc/queue/iosched/writes_starved 1
+    write /sys/block/sdd/queue/iosched/writes_starved 1
+    write /sys/block/sde/queue/iosched/writes_starved 1
+
+    # Enable the latency_sensitive flag for both foreground and top-app - which mimics the old SchedTune prefer-idle flag;
+    write /dev/cpuctl/foreground/cpu.uclamp.latency_sensitive 1
+    write /dev/cpuctl/top-app/cpu.uclamp.latency_sensitive 1
+
+
+    # Allow the foreground CPUSet to use a Prime CPU core for both improved task initializations and device performance;
+    write /dev/cpuset/foreground/cpus "0-5,7"
+
     # scheduler tunables
     # Disable auto-scaling of scheduler tunables with hotplug. The tunables
     # will vary across devices in unpredictable ways if allowed to scale with
     # cpu cores.
     write /proc/sys/kernel/sched_tunable_scaling 0
-    write /proc/sys/kernel/sched_latency_ns 10000000
+    write /proc/sys/kernel/sched_latency_ns 15000000
     write /proc/sys/kernel/sched_wakeup_granularity_ns 2000000
     write /proc/sys/kernel/sched_child_runs_first 0
 
@@ -1163,7 +1206,14 @@ on zygote-start
 on boot && property:ro.config.low_ram=true
     # Tweak background writeout
     write /proc/sys/vm/dirty_expire_centisecs 200
-    write /proc/sys/vm/dirty_background_ratio  5
+    write /proc/sys/vm/dirty_background_ratio  10
+    write /proc/sys/vm/compact_unevictable_allowed 0
+    write /proc/sys/vm/dirty_ratio 30
+    write /proc/sys/vm/oom_dump_tasks 0
+    write /proc/sys/vm/oom_kill_allocating_task 1
+    write /proc/sys/vm/stat_interval 1500
+    write /proc/sys/vm/swappiness 20
+    write /proc/sys/vm/watermark_scale_factor 200
 
 on property:sys.boot_completed=1 && property:ro.config.batteryless=true
     # Flush data and checkpoint more aggressively to prepare sudden power cuts
@@ -1211,9 +1261,89 @@ on boot
     # to make it too large, since it may bring userdata loss, if they
     # are not aware of using fsync()/sync() to prepare sudden power-cut.
     write /dev/sys/fs/by-name/userdata/cp_interval 30
-    write /dev/sys/fs/by-name/userdata/gc_urgent_sleep_time 50
+    write /dev/sys/fs/by-name/userdata/gc_urgent_sleep_time 5
     write /dev/sys/fs/by-name/userdata/iostat_period_ms 1000
-    write /dev/sys/fs/by-name/userdata/iostat_enable 1
+     write /dev/sys/fs/by-name/userdata/iostat_enable 0
+    write /proc/sys/debug/exception-trace 0
+    write /proc/sys/dev/scsi/logging_level 0
+    write /proc/sys/dev/tty/ldisc_autoload 0
+
+    # Put some excessive kernel bloat to sleep;
+    write /sys/module/8250/parameters/skip_txen_test 1
+    write /sys/module/bcmdhd4389/parameters/logdump_ecntr_enable 0
+    write /sys/module/binder/parameters/debug_mask 0
+    write /sys/module/binder_alloc/parameters/debug_mask 0
+    write /sys/module/blk_cgroup/parameters/blkcg_debug_stats N
+    write /sys/module/bluetooth/parameters/disable_ertm Y
+    write /sys/module/bluetooth/parameters/disable_esco Y
+    write /sys/module/cryptomgr/parameters/notests Y
+    write /sys/module/debug_reboot/parameters/enable N
+    write /sys/module/dw3000/parameters/stats_enabled N
+    write /sys/module/edac_core/parameters/edac_mc_log_ce 0
+    write /sys/module/edac_core/parameters/edac_mc_log_ue 0
+    write /sys/module/efi_pstore/parameters/pstore_disable Y
+    write /sys/module/exynos_drm/parameters/debug_dump_mask 0
+    write /sys/module/gspca_main/parameters/debug 0
+    write /sys/module/hid/parameters/debug 0
+    write /sys/module/hid/parameters/ignore_special_drivers 1
+    write /sys/module/hid_apple/parameters/fnmode 0
+    write /sys/module/hid_apple/parameters/iso_layout 0
+    write /sys/module/hid_logitech_hidpp/parameters/disable_raw_mode Y
+    write /sys/module/hid_logitech_hidpp/parameters/disable_tap_to_click Y
+    write /sys/module/hid_magicmouse/parameters/emulate_3button N
+    write /sys/module/hid_magicmouse/parameters/emulate_scroll_wheel N
+    write /sys/module/hid_magicmouse/parameters/scroll_speed 0
+    write /sys/module/hid_steam/parameters/lizard_mode N
+    write /sys/module/ip6_gre/parameters/log_ecn_error N
+    write /sys/module/ip6_tunnel/parameters/log_ecn_error N
+    write /sys/module/ip_gre/parameters/log_ecn_error N
+    write /sys/module/ipip/parameters/log_ecn_error N
+    write /sys/module/janeiro/parameters/wdt_disable Y
+    write /sys/module/keydebug/parameters/kernel_top_enable 0
+    write /sys/module/keydebug/parameters/show_dstate_enable 0
+    write /sys/module/keydebug/parameters/showallcpus_enable 0
+    write /sys/module/printk/parameters/console_suspend Y
+    write /sys/module/rfcomm/parameters/disable_cfc Y
+    write /sys/module/scsi_mod/parameters/scsi_logging_level 0
+    write /sys/module/sit/parameters/log_ecn_error N
+    write /sys/module/spurious/parameters/noirqdebug Y
+    write /sys/module/suspend/parameters/pm_test_delay 0
+    write /sys/module/v4l2_mem2mem/parameters/debug N
+    write /sys/module/videobuf2_common/parameters/debug 0
+    write /sys/module/videobuf2_dma_sg/parameters/debug 0
+    write /sys/module/videobuf2_v4l2/parameters/debug 0
+
+    # Set and increase the minimum target scaling frequencies for the MIF and INT devfreq node paths for improving overall low-level SOC efficiency while reducing the amount of missed frames at the same time during interactive user interactions;
+    write /sys/class/devfreq/17000010.devfreq_mif/exynos_data/debug_scaling_devfreq_min 1014000
+    write /sys/class/devfreq/17000010.devfreq_mif/scaling_devfreq_min 1014000
+    write /sys/class/devfreq/17000020.devfreq_int/exynos_data/debug_scaling_devfreq_min 200000
+    write /sys/class/devfreq/17000020.devfreq_int/scaling_devfreq_min 200000
+
+    write /sys/devices/platform/28000000.mali/csg_scheduling_period 80
+    write /sys/devices/platform/28000000.mali/idle_hysteresis_time 80
+    write /sys/devices/platform/28000000.mali/pm_poweroff "251000 2 0"
+
+    # LITTLE Cluster;
+    write /sys/devices/system/cpu/cpufreq/policy0/sched_pixel/lcpi_threshold 2
+    write /sys/devices/system/cpu/cpufreq/policy0/sched_pixel/limit_frequency 930000
+    write /sys/devices/system/cpu/cpufreq/policy0/sched_pixel/spc_threshold 44
+
+    # Big Cluster;
+    write /sys/devices/system/cpu/cpufreq/policy4/sched_pixel/lcpi_threshold 4
+   write /sys/devices/system/cpu/cpufreq/policy4/sched_pixel/limit_frequency 1328000
+    write /sys/devices/system/cpu/cpufreq/policy4/sched_pixel/spc_threshold 25
+
+    # Prime Cluster;
+    write /sys/devices/system/cpu/cpufreq/policy6/sched_pixel/lcpi_threshold 4
+    write /sys/devices/system/cpu/cpufreq/policy6/sched_pixel/limit_frequency 1426000
+    write /sys/devices/system/cpu/cpufreq/policy6/sched_pixel/spc_threshold 20
+
+    # Do the same about GC_URGENT_SLEEP_TIME here as well that we just did in the initial phase and section of this config;
+    write /sys/fs/f2fs/dm-38/gc_urgent_sleep_time 5
+    write /sys/fs/f2fs/sda5/gc_urgent_sleep_time 5
+    write /sys/fs/f2fs/sda6/gc_urgent_sleep_time 5
+    write /sys/fs/f2fs/sda7/gc_urgent_sleep_time 5
+    write /sys/fs/f2fs/sda8/gc_urgent_sleep_time 5
 
     # set readahead multiplier for POSIX_FADV_SEQUENTIAL files
     write /dev/sys/fs/by-name/userdata/seq_file_ra_mul 128
@@ -1320,6 +1450,17 @@ on property:net.tcp_def_init_rwnd=*
     write /proc/sys/net/ipv4/tcp_default_init_rwnd ${net.tcp_def_init_rwnd}
 
 import /system/etc/init/init-perfetto.rc
+
+# Don't allow to flood or swarm the kernel printk console with warnings messages about potentially hung tasks per default;
+    write /proc/sys/kernel/hung_task_check_count 0
+    write /proc/sys/kernel/hung_task_warnings 0
+    write /proc/sys/kernel/panic_on_oops 0
+    write /proc/sys/fs/lease-break-time 20
+
+    write /proc/sys/kernel/sched_migration_cost_ns 1000000
+    write /proc/sys/kernel/sched_min_granularity_ns 2000000
+
+    write /proc/sys/kernel/sched_pelt_multiplier 2
 
 # on shutdown
 # In device's init.rc, this trigger can be used to do device-specific actions
