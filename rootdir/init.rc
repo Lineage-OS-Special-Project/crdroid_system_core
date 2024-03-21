@@ -1203,10 +1203,9 @@ on zygote-start
     start zygote
     start zygote_secondary
 
-on boot && property:ro.config.low_ram=true
     # Tweak background writeout
+on boot && property:ro.config.low_ram=true
     write /proc/sys/vm/dirty_expire_centisecs 200
-    write /proc/sys/vm/dirty_background_ratio  10
     write /proc/sys/vm/compact_unevictable_allowed 0
     write /proc/sys/vm/dirty_ratio 30
     write /proc/sys/vm/oom_dump_tasks 0
@@ -1239,6 +1238,8 @@ on boot
     # parameters to match how it is managing things.
     write /proc/sys/vm/overcommit_memory 1
     write /proc/sys/vm/min_free_order_shift 4
+    write /proc/sys/vm/dirty_background_bytes 52428800
+    write /proc/sys/vm/dirty_bytes 209715200
 
     # System server manages zram writeback
     chown root system /sys/block/zram0/idle
