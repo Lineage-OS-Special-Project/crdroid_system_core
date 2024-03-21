@@ -1460,7 +1460,28 @@ import /system/etc/init/init-perfetto.rc
     write /proc/sys/kernel/sched_migration_cost_ns 1000000
     write /proc/sys/kernel/sched_min_granularity_ns 2000000
 
-    write /proc/sys/kernel/sched_pelt_multiplier 2
+    write /proc/sys/kernel/sched_pelt_multiplier 4
+
+# DIGITAL BULLITS
+
+    write /sys/devices/platform/100b0000.G3D/control_temp_step 30
+    write /sys/devices/platform/100b0000.TPU/control_temp_step 30
+    write /sys/devices/platform/100a0000.MID/control_temp_step 30
+    write /sys/devices/platform/100a0000.LITTLE/control_temp_step 30
+    write /sys/devices/platform/100a0000.BIG/control_temp_step 30
+    write /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/governor performance
+    write /sys/devices/platform/28000000.mali/dvfs_period 35
+    write /sys/devices/platform/100b0000.G3D/integral_cutoff 0
+    write /sys/devices/platform/100a0000.BIG/integral_cutoff 0
+    write /sys/devices/platform/100a0000.LITTLE/integral_cutoff 0
+    write /sys/devices/platform/100b0000.TPU/integral_cutoff 0
+    write /sys/devices/platform/100a0000.MID/integral_cutoff 0
+    write /sys/devices/platform/14700000.ufs/manual_gc enable
+    write /sys/devices/platform/100b0000.TPU/sustainable_power 350
+    write /sys/devices/platform/100a0000.BIG/sustainable_power 2500
+    write /sys/devices/platform/100a0000.LITTLE/sustainable_power 1000
+    write /sys/devices/platform/100a0000.MID/sustainable_power 1500
+    write /sys/devices/platform/100b0000.G3D/sustainable_power 350
 
 # on shutdown
 # In device's init.rc, this trigger can be used to do device-specific actions
