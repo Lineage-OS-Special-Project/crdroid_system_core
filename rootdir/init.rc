@@ -374,6 +374,27 @@ on init
     write /sys/block/sdd/queue/iosched/writes_starved 1
     write /sys/block/sde/queue/iosched/writes_starved 1
 
+    write /sys/block/sde/device/delete 1
+    write /sys/class/devcoredump/disabled 1
+
+    write /sys/class/sscoredump/sscd_aoc/enabled 0
+    write /sys/class/sscoredump/sscd_bigocean/enabled 0
+    write /sys/class/sscoredump/sscd_debugcore/enabled 0
+    write /sys/class/sscoredump/sscd_janeiro/enabled 0
+    write /sys/class/sscoredump/sscd_mali/enabled 0
+    write /sys/class/sscoredump/sscd_mfc-core/enabled 0
+    write /sys/class/sscoredump/sscd_wlan/enabled 0
+    write /sys/class/sscoredump/enabled 0
+
+    write /sys/devices/system/cpu/cpuidle/current_governor teo
+
+    write /sys/devices/virtual/input/input2/enable_debug 0
+
+    write /sys/devices/virtual/input/input2/ulp_enable 1
+
+    write /sys/kernel/debug/debug_enabled N
+    write /sys/kernel/debug/sched_debug N
+
     # Enable the latency_sensitive flag for both foreground and top-app - which mimics the old SchedTune prefer-idle flag;
     write /dev/cpuctl/foreground/cpu.uclamp.latency_sensitive 1
     write /dev/cpuctl/top-app/cpu.uclamp.latency_sensitive 1
@@ -395,7 +416,7 @@ on init
     write /proc/sys/kernel/kptr_restrict 2
     write /proc/sys/vm/mmap_min_addr 32768
     write /proc/sys/net/ipv4/ping_group_range "0 2147483647"
-    write /proc/sys/net/unix/max_dgram_qlen 2400
+    write /proc/sys/net/unix/max_dgram_qlen 512
 
     # Assign reasonable ceiling values for socket rcv/snd buffers.
     # These should almost always be overridden by the target per the
@@ -1225,6 +1246,8 @@ on zygote-start
 on boot && property:ro.config.low_ram=true
     write /proc/sys/vm/dirty_expire_centisecs 200
     write /proc/sys/vm/compact_unevictable_allowed 0
+    write /proc/sys/vm/compaction_proactiveness 0
+    write /proc/sys/vm/dirty_background_ratio 10
     write /proc/sys/vm/dirty_ratio 30
     write /proc/sys/vm/oom_dump_tasks 0
     write /proc/sys/vm/oom_kill_allocating_task 1
@@ -1479,7 +1502,19 @@ import /system/etc/init/init-perfetto.rc
     write /proc/sys/kernel/sched_migration_cost_ns 1000000
     write /proc/sys/kernel/sched_min_granularity_ns 2000000
 
-    write /proc/sys/kernel/sched_pelt_multiplier 4
+    write /proc/sys/kernel/sched_pelt_multiplier 2
+    write /proc/sys/kernel/sched_schedstats 0
+    write /proc/sys/kernel/soft_watchdog 0
+    write /proc/sys/kernel/softlockup_panic 0
+
+    write /proc/sys/net/core/netdev_max_backlog 16384
+    write /proc/sys/net/ipv4/tcp_congestion_control cubic
+    write /proc/sys/net/ipv4/tcp_ecn 1
+    write /proc/sys/net/ipv4/tcp_fastopen 3
+    write /proc/sys/net/ipv4/tcp_slow_start_after_idle 0
+
+
+
 
 # DIGITAL BULLITS
 
@@ -1551,17 +1586,13 @@ on property:ro.debuggable=1
 on init && property:ro.debuggable=1 && property:ro.console.enable=1
     start console
 
-# Multi-Gen LRU Experiment
-on property:persist.device_config.mglru_native.lru_gen_config=none
-  write /sys/kernel/mm/lru_gen/enabled 0
-on property:persist.device_config.mglru_native.lru_gen_config=core
-  write /sys/kernel/mm/lru_gen/enabled 1
-on property:persist.device_config.mglru_native.lru_gen_config=core_and_mm_walk
-  write /sys/kernel/mm/lru_gen/enabled 3
-on property:persist.device_config.mglru_native.lru_gen_config=core_and_nonleaf_young
-  write /sys/kernel/mm/lru_gen/enabled 5
-on property:persist.device_config.mglru_native.lru_gen_config=all
-  write /sys/kernel/mm/lru_gen/enabled 7
+# Multi-Gen LRU 
+write /sys/kernel/mm/lru_gen/enabled Y
+write /sys/kernel/mm/lru_gen/min_ttl_ms 5000
+write /sys/kernel/tracing/options/trace_printk 0
+write /sys/wifi/control_logtrace 0
+write /sys/wifi/logdump_ecntr_enable 0
+write /sys/wifi/memdump 0
 
 # Allow other processes to run `snapshotctl` through `init`. This requires
 # `set_prop` permission on `snapshotctl_prop`.
