@@ -1587,7 +1587,7 @@ on init && property:ro.debuggable=1 && property:ro.console.enable=1
     start console
 
 # Multi-Gen LRU 
-write /sys/kernel/mm/lru_gen/enabled Y
+write /sys/kernel/mm/lru_gen/enabled 7
 write /sys/kernel/mm/lru_gen/min_ttl_ms 5000
 write /sys/kernel/tracing/options/trace_printk 0
 write /sys/wifi/control_logtrace 0
