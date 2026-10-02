@@ -16,6 +16,8 @@ pub(crate) static DEFAULT_IO_DEPTH: u16 = 2;
 pub(crate) static DEFAULT_MAX_FDS: u16 = 128;
 pub(crate) static DEFAULT_EXIT_ON_ERROR: bool = false;
 pub(crate) static DEFAULT_RECORD_METRICS: bool = false;
+pub(crate) static DEFAULT_MAX_BYTES: u64 = 0;
+pub(crate) static DEFAULT_MAX_DURATION_MS: u64 = 0;
 
 mod args_argh;
 use args_argh as args_internal;
@@ -60,6 +62,23 @@ fn verify_and_fix(args: &mut MainArgs) -> Result<(), Error> {
             }
         }
         SubCommands::Replay(arg) => {
+            if arg.io_depth == 0 {
+                return Err(Error::InvalidArgs {
+                    arg_name: "io-depth".to_string(),
+                    arg_value: arg.io_depth.to_string(),
+                    error: "must be greater than zero".to_string(),
+                });
+            }
+            if arg.max_fds == 0 {
+                return Err(Error::InvalidArgs {
+                    arg_name: "max-fds".to_string(),
+                    arg_value: arg.max_fds.to_string(),
+                    error: "must be greater than zero".to_string(),
+                });
+            }
+            // Android replay treats a missing profile as an expected no-op in
+            // can_perform_replay(). Do not reject it during argument parsing.
+            #[cfg(not(target_os = "android"))]
             ensure_path_exists(&arg.path)?;
             if !arg.config_path.as_os_str().is_empty() {
                 ensure_path_exists(&arg.config_path)?;
