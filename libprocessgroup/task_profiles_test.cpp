@@ -15,14 +15,17 @@
  */
 
 #include "task_profiles.h"
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/strings.h>
+#include <android-base/test_utils.h>
 #include <gtest/gtest.h>
 #include <mntent.h>
 #include <processgroup/processgroup.h>
 #include <stdio.h>
 #include <unistd.h>
 
+#include <filesystem>
 #include <fstream>
 
 using ::android::base::ERROR;
@@ -200,6 +203,121 @@ TEST_P(TaskProfileFixture, TaskProfile) {
     tp2.Add(std::make_unique<ApplyProfileAction>(profiles));
     EXPECT_EQ(tp2.IsValidForProcess(getuid(), getpid()), params.result);
     EXPECT_EQ(tp2.IsValidForTask(getpid()), params.result);
+}
+
+class CompactMemcgActionTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        process_path_ = ConvertUidPidToPath(temp_dir_.path, getuid(), getpid(), true);
+        ASSERT_TRUE(std::filesystem::create_directories(process_path_));
+        current_path_ = process_path_ + "/memory.current";
+        reclaim_path_ = process_path_ + "/memory.reclaim";
+    }
+
+    void WriteCurrent(const std::string& value) {
+        ASSERT_TRUE(android::base::WriteStringToFile(value, current_path_));
+    }
+
+    void CreateReclaimFile() { ASSERT_TRUE(android::base::WriteStringToFile("", reclaim_path_)); }
+
+    TemporaryDir temp_dir_;
+    std::string process_path_;
+    std::string current_path_;
+    std::string reclaim_path_;
+};
+
+TEST_F(CompactMemcgActionTest, MissingMemoryReclaimIsInvalid) {
+    WriteCurrent("4096\n");
+    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
+
+    EXPECT_FALSE(action.IsValidForProcess(getuid(), getpid()));
+}
+
+TEST_F(CompactMemcgActionTest, MissingMemoryReclaimDegradesCleanlyAtExecution) {
+    WriteCurrent("4096\n");
+    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
+    ScopedLogCapturer captured_log;
+
+    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
+    for (const auto& log : captured_log.Log()) {
+        EXPECT_LT(log.severity, ERROR) << log.message;
+    }
+}
+
+TEST_F(CompactMemcgActionTest, FullReclaimWritesCurrentUsage) {
+    WriteCurrent("4096\n");
+    CreateReclaimFile();
+    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
+
+    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
+    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
+
+    std::string value;
+    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
+    EXPECT_EQ(value, "4096");
+}
+
+TEST_F(CompactMemcgActionTest, AnonReclaimUsesOptionalSwappinessSyntax) {
+    WriteCurrent("8192\n");
+    CreateReclaimFile();
+    CompactMemcgAction action(CompactMemcgAction::ANON, temp_dir_.path);
+
+    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
+    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
+
+    std::string value;
+    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
+    EXPECT_EQ(value, "8192 swappiness=200");
+}
+
+TEST_F(CompactMemcgActionTest, SupportedOptionalSyntaxIsNotReprobed) {
+    WriteCurrent("8192\n");
+    CreateReclaimFile();
+    CompactMemcgAction action(CompactMemcgAction::ANON, temp_dir_.path);
+
+    ASSERT_TRUE(action.IsValidForProcess(getuid(), getpid()));
+    ASSERT_TRUE(android::base::WriteStringToFile("sentinel", reclaim_path_));
+    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
+
+    std::string value;
+    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
+    EXPECT_EQ(value, "sentinel");
+}
+
+TEST_F(CompactMemcgActionTest, FileReclaimUsesOptionalSwappinessSyntax) {
+    WriteCurrent("16384\n");
+    CreateReclaimFile();
+    CompactMemcgAction action(CompactMemcgAction::FILE, temp_dir_.path);
+
+    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
+    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
+
+    std::string value;
+    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
+    EXPECT_EQ(value, "16384 swappiness=0");
+}
+
+TEST_F(CompactMemcgActionTest, MissingMemoryCurrentRemainsAnError) {
+    CreateReclaimFile();
+    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
+    ScopedLogCapturer captured_log;
+
+    EXPECT_FALSE(action.ExecuteForProcess(getuid(), getpid()));
+    ASSERT_EQ(captured_log.Log().size(), 1U);
+    EXPECT_EQ(captured_log.Log()[0].severity, ERROR);
+    EXPECT_EQ(captured_log.Log()[0].message.find("Failed to read"), 0U);
+}
+
+TEST_F(CompactMemcgActionTest, GenuineReclaimWriteFailureRemainsAnError) {
+    WriteCurrent("4096\n");
+    ASSERT_TRUE(std::filesystem::create_directory(reclaim_path_));
+    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
+    ScopedLogCapturer captured_log;
+
+    EXPECT_FALSE(action.ExecuteForProcess(getuid(), getpid()));
+    ASSERT_EQ(captured_log.Log().size(), 1U);
+    EXPECT_EQ(captured_log.Log()[0].severity, ERROR);
+    EXPECT_EQ(captured_log.Log()[0].message.find("Could not write"), 0U);
 }
 
 // Test the four combinations of optional_attr {false, true} and cgroup attribute { does not exist,
