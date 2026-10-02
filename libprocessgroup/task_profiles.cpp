@@ -337,15 +337,11 @@ bool SetCgroupAction::AddTidToCgroup(pid_t tid, int fd, ResourceCacheType cache_
     // ENOSPC is returned when cpuset cgroup that we are joining has no online cpus
     if (errno == ENOSPC && !strcmp(controller_name, "cpuset")) {
         // This is an abnormal case happening only in testing, so report it only once
-        static bool empty_cpuset_reported = false;
-
-        if (empty_cpuset_reported) {
-            return true;
+        static std::atomic_bool empty_cpuset_reported = false;
+        if (!empty_cpuset_reported.exchange(true, std::memory_order_relaxed)) {
+            LOG(ERROR) << "Failed to add task '" << value
+                       << "' into cpuset because all cpus in that cpuset are offline";
         }
-
-        LOG(ERROR) << "Failed to add task '" << value
-                   << "' into cpuset because all cpus in that cpuset are offline";
-        empty_cpuset_reported = true;
     } else {
         PLOG(ERROR) << "AddTidToCgroup failed to write '" << value << "'; path=" << path_ << "; "
                     << (cache_type == RCT_TASK ? "task" : "process");
@@ -579,15 +575,16 @@ bool WriteFileAction::ExecuteForProcess(uid_t uid, pid_t pid) const {
     }
 
     dirent* de;
+    bool success = true;
     while ((de = readdir(d.get()))) {
         pid_t t_pid = atoi(de->d_name);
         if (!t_pid) {
             continue;
         }
 
-        WriteValueToFile(value_, ProfileAction::RCT_TASK, uid, t_pid, logfailures_);
+        success &= WriteValueToFile(value_, ProfileAction::RCT_TASK, uid, t_pid, logfailures_);
     }
-    return true;
+    return success;
 }
 
 bool WriteFileAction::ExecuteForTask(pid_t tid) const {
@@ -682,10 +679,11 @@ bool SetSchedulerPolicyAction::toPriority(int policy, int virtual_priority, int&
 
 bool SetSchedulerPolicyAction::ExecuteForTask(pid_t tid) const {
     struct sched_param param = {};
-    param.sched_priority = isNormalPolicy(policy_) ? 0 : *priority_or_nice_;
+    const int priority_or_nice = priority_or_nice_.value_or(0);
+    param.sched_priority = isNormalPolicy(policy_) ? 0 : priority_or_nice;
     if (sched_setscheduler(tid, policy_, &param) == -1) {
         PLOG(WARNING) << "SetSchedulerPolicy: Failed to apply scheduler policy (" << policy_
-                      << ") with priority (" << *priority_or_nice_ << ") to tid " << tid;
+                      << ") with priority (" << priority_or_nice << ") to tid " << tid;
         return false;
     }
 
@@ -865,17 +863,19 @@ bool CompactMemcgAction::IsValidForProcess(uid_t uid, pid_t pid) const {
 }
 
 bool ApplyProfileAction::ExecuteForProcess(uid_t uid, pid_t pid) const {
+    bool success = true;
     for (const auto& profile : profiles_) {
-        profile->ExecuteForProcess(uid, pid);
+        success &= profile->ExecuteForProcess(uid, pid);
     }
-    return true;
+    return success;
 }
 
 bool ApplyProfileAction::ExecuteForTask(pid_t tid) const {
+    bool success = true;
     for (const auto& profile : profiles_) {
-        profile->ExecuteForTask(tid);
+        success &= profile->ExecuteForTask(tid);
     }
-    return true;
+    return success;
 }
 
 void ApplyProfileAction::EnableResourceCaching(ResourceCacheType cache_type) {
@@ -910,7 +910,9 @@ bool ApplyProfileAction::IsValidForTask(pid_t tid) const {
 
 void TaskProfile::MoveTo(TaskProfile* profile) {
     profile->elements_ = std::move(elements_);
-    profile->res_cached_ = res_cached_;
+    // Load-time overrides replace all actions. Any cache state belonged to the
+    // old actions and must not be carried over to the replacements.
+    for (bool& cached : profile->res_cached_) cached = false;
 }
 
 bool TaskProfile::ExecuteForProcess(uid_t uid, pid_t pid) const {
@@ -947,27 +949,35 @@ bool TaskProfile::ExecuteForUID(uid_t uid) const {
 }
 
 void TaskProfile::EnableResourceCaching(ProfileAction::ResourceCacheType cache_type) {
-    if (res_cached_) {
+    if (cache_type < ProfileAction::RCT_TASK || cache_type >= ProfileAction::RCT_COUNT) {
+        LOG(ERROR) << "Invalid cache type is specified!";
         return;
     }
+
+    std::lock_guard<std::mutex> lock(res_cache_mutex_);
+    if (res_cached_[cache_type]) return;
 
     for (auto& element : elements_) {
         element->EnableResourceCaching(cache_type);
     }
 
-    res_cached_ = true;
+    res_cached_[cache_type] = true;
 }
 
 void TaskProfile::DropResourceCaching(ProfileAction::ResourceCacheType cache_type) {
-    if (!res_cached_) {
+    if (cache_type < ProfileAction::RCT_TASK || cache_type >= ProfileAction::RCT_COUNT) {
+        LOG(ERROR) << "Invalid cache type is specified!";
         return;
     }
+
+    std::lock_guard<std::mutex> lock(res_cache_mutex_);
+    if (!res_cached_[cache_type]) return;
 
     for (auto& element : elements_) {
         element->DropResourceCaching(cache_type);
     }
 
-    res_cached_ = false;
+    res_cached_[cache_type] = false;
 }
 
 bool TaskProfile::IsValidForProcess(uid_t uid, pid_t pid) const {
@@ -1300,6 +1310,7 @@ const IProfileAttribute* TaskProfiles::GetAttribute(std::string_view name) const
 
 template <typename T>
 bool TaskProfiles::SetUserProfiles(uid_t uid, std::span<const T> profiles, bool use_fd_cache) {
+    bool success = true;
     for (const auto& name : profiles) {
         TaskProfile* profile = GetProfile(name);
         if (profile != nullptr) {
@@ -1307,13 +1318,15 @@ bool TaskProfiles::SetUserProfiles(uid_t uid, std::span<const T> profiles, bool 
                 profile->EnableResourceCaching(ProfileAction::RCT_PROCESS);
             }
             if (!profile->ExecuteForUID(uid)) {
-                PLOG(WARNING) << "Failed to apply " << name << " process profile";
+                LOG(WARNING) << "Failed to apply " << name << " user profile";
+                success = false;
             }
         } else {
-            PLOG(WARNING) << "Failed to find " << name << "process profile";
+            LOG(WARNING) << "Failed to find " << name << " user profile";
+            success = false;
         }
     }
-    return true;
+    return success;
 }
 
 template <typename T>
