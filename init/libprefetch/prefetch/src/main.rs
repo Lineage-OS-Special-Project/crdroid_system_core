@@ -37,5 +37,6 @@ fn main() {
 
     if let Err(err) = ret {
         error!("{args:?} command failed: {err:?}");
+        std::process::exit(1);
     }
 }
