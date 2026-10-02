@@ -57,6 +57,7 @@ pub use arch::android::*;
 
 /// Records prefetch data for the given configuration
 pub fn record(args: &RecordArgs) -> Result<(), Error> {
+    let start_time = std::time::Instant::now();
     #[cfg(target_os = "android")]
     if !can_perform_record(
         &args.get_ready_path(),
@@ -116,14 +117,25 @@ pub fn record(args: &RecordArgs) -> Result<(), Error> {
         .map_err(|source| Error::Create { source, path: path.to_str().unwrap().to_owned() })?;
 
     // Write the record file
+    let record_count = rf.inner.records.len();
+    let file_count = rf.inner.inode_map.len();
+    let serialized = rf.add_checksum_and_serialize()?;
     out_file
-        .write_all(&rf.add_checksum_and_serialize()?)
+        .write_all(&serialized)
         .map_err(|source| Error::Write { path: path.to_str().unwrap().to_owned(), source })?;
     out_file.sync_all()?;
 
     // Write build-finger-print file
     #[cfg(target_os = "android")]
     write_build_fingerprint(&args.build_fingerprint_path)?;
+
+    info!(
+        "Record complete: duration_ms={} files={} records={} profile_bytes={}",
+        start_time.elapsed().as_millis(),
+        file_count,
+        record_count,
+        serialized.len()
+    );
 
     Ok(())
 }
