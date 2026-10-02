@@ -125,6 +125,13 @@ pub enum Error {
         path: String,
     },
 
+    /// Indicates that every recorded path now refers to different file metadata.
+    #[error("Recorded file changed since profiling: {path}")]
+    StaleFile {
+        /// Last path checked for this file.
+        path: String,
+    },
+
     /// Represents spurious InodeInfo or missing Record.
     ///
     #[error(
