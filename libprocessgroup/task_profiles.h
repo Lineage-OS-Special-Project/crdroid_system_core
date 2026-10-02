@@ -229,7 +229,7 @@ class CompactMemcgAction : public ProfileAction {
 
 class TaskProfile {
   public:
-    TaskProfile(const std::string& name) : name_(name), res_cached_(false) {}
+    TaskProfile(const std::string& name) : name_(name) {}
 
     const std::string& Name() const { return name_; }
     void Add(std::unique_ptr<ProfileAction> e) { elements_.push_back(std::move(e)); }
@@ -245,7 +245,8 @@ class TaskProfile {
 
   private:
     const std::string name_;
-    bool res_cached_;
+    bool res_cached_[ProfileAction::RCT_COUNT] = {};
+    std::mutex res_cache_mutex_;
     std::vector<std::unique_ptr<ProfileAction>> elements_;
 };
 
