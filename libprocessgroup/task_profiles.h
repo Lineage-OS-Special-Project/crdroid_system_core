@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -209,15 +210,21 @@ class CompactMemcgAction : public ProfileAction {
     bool IsValidForUID(uid_t uid) const override;
 
   private:
+    enum class OptionalSyntaxState { UNKNOWN, SUPPORTED, UNSUPPORTED };
+
     static constexpr const char* MEMORY_CURRENT_FILE = "/memory.current";
     static constexpr const char* MEMORY_RECLAIM_FILE = "/memory.reclaim";
     Type type_;
     std::string cgroup_v2_root_path_;
+    mutable std::atomic<OptionalSyntaxState> optional_syntax_state_ = OptionalSyntaxState::UNKNOWN;
 
     bool GenerateReclaimString(const std::string& memory_current_path, std::string& out) const;
     bool Execute(const std::string& memory_current_path,
                  const std::string& memory_reclaim_path) const;
     bool IsValid(const std::string& memory_reclaim_path) const;
+    bool UsesOptionalSyntax() const { return type_ != Type::FULL; }
+    void SetOptionalSyntaxSupported() const;
+    void SetOptionalSyntaxUnsupported(int error) const;
 };
 
 class TaskProfile {
