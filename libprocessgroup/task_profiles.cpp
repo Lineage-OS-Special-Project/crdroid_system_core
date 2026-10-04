@@ -19,6 +19,7 @@
 
 #include <task_profiles.h>
 
+#include <cstring>
 #include <map>
 #include <string>
 
@@ -700,16 +701,61 @@ bool CompactMemcgAction::GenerateReclaimString(const std::string& memory_current
 
 bool CompactMemcgAction::Execute(const std::string& memory_current_path,
                                  const std::string& memory_reclaim_path) const {
-    std::string reclaim_str;
-    if (!GenerateReclaimString(memory_current_path, reclaim_str)) return false;
-
-    if (!WriteStringToFile(reclaim_str, memory_reclaim_path) && errno != EAGAIN) {
-        // Reclaim of the entire memcg is likely to fail with EAGAIN. Ignore this case here.
-        PLOG(ERROR) << "Could not write " << reclaim_str << " to " << memory_reclaim_path;
+    if (UsesOptionalSyntax() &&
+        optional_syntax_state_.load(std::memory_order_relaxed) == OptionalSyntaxState::UNSUPPORTED) {
+        errno = EOPNOTSUPP;
         return false;
     }
 
-    return true;
+    std::string reclaim_str;
+    if (!GenerateReclaimString(memory_current_path, reclaim_str)) return false;
+
+    if (WriteStringToFile(reclaim_str, memory_reclaim_path)) {
+        if (UsesOptionalSyntax()) SetOptionalSyntaxSupported();
+        return true;
+    }
+
+    const int error = errno;
+
+    // memory.reclaim is optional. Treat a missing interface as unsupported only
+    // when memory.current proves that the target memcg itself still exists.
+    // Otherwise ENOENT describes a missing or concurrently removed cgroup and
+    // remains an actionable failure.
+    if (error == ENOENT && access(memory_current_path.c_str(), F_OK) == 0) {
+        LOG(VERBOSE) << memory_reclaim_path << " is not supported";
+        return true;
+    }
+
+    // The swappiness key is an optional extension to memory.reclaim. EINVAL is
+    // classified as an unsupported capability only for a write containing that
+    // exact syntax. The selective action still fails because no reclaim took
+    // place. A full reclaim returning EINVAL remains an error.
+    if (UsesOptionalSyntax() && (error == EINVAL || error == EOPNOTSUPP)) {
+        SetOptionalSyntaxUnsupported(error);
+        errno = error;
+        return false;
+    }
+
+    // memory.reclaim returns EAGAIN when it could not reclaim the entire
+    // requested amount. The operation is intentionally best-effort here, so do
+    // not retry and delay cgroup teardown.
+    if (error == EAGAIN) {
+        if (UsesOptionalSyntax()) SetOptionalSyntaxSupported();
+        LOG(VERBOSE) << "Partially reclaimed memory from " << memory_reclaim_path;
+        return true;
+    }
+
+    // EOPNOTSUPP for a plain reclaim means that the optional memory.reclaim
+    // interface is present but unavailable in this kernel or cgroup
+    // configuration.
+    if (!UsesOptionalSyntax() && error == EOPNOTSUPP) {
+        LOG(VERBOSE) << memory_reclaim_path << " is not supported";
+        return true;
+    }
+
+    errno = error;
+    PLOG(ERROR) << "Could not write " << reclaim_str << " to " << memory_reclaim_path;
+    return false;
 }
 
 bool CompactMemcgAction::ExecuteForUID(uid_t uid) const {
@@ -735,11 +781,51 @@ bool CompactMemcgAction::IsValid(const std::string& memory_reclaim_path) const {
 
     // Anon-only and file-only reclaim depend on memory.reclaim swappiness support:
     // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=68cd9050d871e4db5433420b5ceb32f5512d18bc
-    if (type_ != CompactMemcgAction::Type::FULL) {
-        return WriteStringToFile("0 swappiness=0", memory_reclaim_path);
+    if (UsesOptionalSyntax()) {
+        const OptionalSyntaxState state = optional_syntax_state_.load(std::memory_order_relaxed);
+        if (state != OptionalSyntaxState::UNKNOWN) {
+            return state == OptionalSyntaxState::SUPPORTED;
+        }
+
+        if (WriteStringToFile("0 swappiness=0", memory_reclaim_path)) {
+            SetOptionalSyntaxSupported();
+            return true;
+        }
+
+        const int error = errno;
+        if (error == EINVAL || error == EOPNOTSUPP) {
+            SetOptionalSyntaxUnsupported(error);
+            return false;
+        }
+        if (error == EAGAIN) {
+            SetOptionalSyntaxSupported();
+            return true;
+        }
+        // The cgroup may have disappeared after access() above. This is not
+        // evidence that the kernel lacks optional swappiness support.
+        if (error == ENOENT) return false;
+
+        errno = error;
+        PLOG(ERROR) << "Could not probe optional memory.reclaim syntax at " << memory_reclaim_path;
+        return false;
     }
 
     return true;
+}
+
+void CompactMemcgAction::SetOptionalSyntaxSupported() const {
+    OptionalSyntaxState expected = OptionalSyntaxState::UNKNOWN;
+    optional_syntax_state_.compare_exchange_strong(expected, OptionalSyntaxState::SUPPORTED,
+                                                   std::memory_order_relaxed);
+}
+
+void CompactMemcgAction::SetOptionalSyntaxUnsupported(int error) const {
+    OptionalSyntaxState expected = OptionalSyntaxState::UNKNOWN;
+    if (optional_syntax_state_.compare_exchange_strong(expected, OptionalSyntaxState::UNSUPPORTED,
+                                                       std::memory_order_relaxed)) {
+        LOG(INFO) << "Optional memory.reclaim swappiness syntax is not supported: "
+                  << strerror(error);
+    }
 }
 
 // Ensure memcgs are activated all the way down to UID cgroups
