@@ -22,11 +22,13 @@
 #include <gtest/gtest.h>
 #include <mntent.h>
 #include <processgroup/processgroup.h>
+#include <sched.h>
 #include <stdio.h>
 #include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 using ::android::base::ERROR;
 using ::android::base::LogFunction;
@@ -183,6 +185,110 @@ class TaskProfileFixture : public TestWithParam<TestParam> {
   public:
     ~TaskProfileFixture() = default;
 };
+
+class RecordingAction : public ProfileAction {
+  public:
+    explicit RecordingAction(bool result = true) : result_(result) {}
+
+    const char* Name() const override { return "Recording"; }
+    bool ExecuteForProcess(uid_t, pid_t) const override {
+        ++process_executions;
+        return result_;
+    }
+    bool ExecuteForTask(pid_t) const override {
+        ++task_executions;
+        return result_;
+    }
+    void EnableResourceCaching(ResourceCacheType cache_type) override {
+        ++cache_enables[cache_type];
+    }
+    void DropResourceCaching(ResourceCacheType cache_type) override {
+        ++cache_drops[cache_type];
+    }
+
+    mutable std::atomic<int> process_executions = 0;
+    mutable std::atomic<int> task_executions = 0;
+    std::atomic<int> cache_enables[RCT_COUNT] = {};
+    std::atomic<int> cache_drops[RCT_COUNT] = {};
+
+  private:
+    bool result_;
+};
+
+TEST(TaskProfileTest, ResourceCachesAreIndependentAndConcurrencySafe) {
+    TaskProfile profile("test_profile");
+    auto action = std::make_unique<RecordingAction>();
+    RecordingAction* action_ptr = action.get();
+    profile.Add(std::move(action));
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&profile]() {
+            profile.EnableResourceCaching(ProfileAction::RCT_TASK);
+            profile.EnableResourceCaching(ProfileAction::RCT_PROCESS);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    EXPECT_EQ(action_ptr->cache_enables[ProfileAction::RCT_TASK], 1);
+    EXPECT_EQ(action_ptr->cache_enables[ProfileAction::RCT_PROCESS], 1);
+
+    profile.DropResourceCaching(ProfileAction::RCT_TASK);
+    EXPECT_EQ(action_ptr->cache_drops[ProfileAction::RCT_TASK], 1);
+    EXPECT_EQ(action_ptr->cache_drops[ProfileAction::RCT_PROCESS], 0);
+
+    profile.DropResourceCaching(ProfileAction::RCT_PROCESS);
+    EXPECT_EQ(action_ptr->cache_drops[ProfileAction::RCT_PROCESS], 1);
+}
+
+TEST(TaskProfileTest, ActionReplacementResetsResourceCacheState) {
+    TaskProfile existing("test_profile");
+    auto old_action = std::make_unique<RecordingAction>();
+    existing.Add(std::move(old_action));
+    existing.EnableResourceCaching(ProfileAction::RCT_TASK);
+
+    TaskProfile replacement("test_profile");
+    auto new_action = std::make_unique<RecordingAction>();
+    RecordingAction* new_action_ptr = new_action.get();
+    replacement.Add(std::move(new_action));
+
+    replacement.MoveTo(&existing);
+    existing.EnableResourceCaching(ProfileAction::RCT_TASK);
+    EXPECT_EQ(new_action_ptr->cache_enables[ProfileAction::RCT_TASK], 1);
+}
+
+TEST(TaskProfileTest, AggregatePreservesOrderAndPropagatesFailure) {
+    auto failing_profile = std::make_shared<TaskProfile>("failing");
+    auto failing_action = std::make_unique<RecordingAction>(false);
+    RecordingAction* failing_action_ptr = failing_action.get();
+    failing_profile->Add(std::move(failing_action));
+
+    auto succeeding_profile = std::make_shared<TaskProfile>("succeeding");
+    auto succeeding_action = std::make_unique<RecordingAction>();
+    RecordingAction* succeeding_action_ptr = succeeding_action.get();
+    succeeding_profile->Add(std::move(succeeding_action));
+
+    TaskProfile aggregate("aggregate");
+    aggregate.Add(std::make_unique<ApplyProfileAction>(
+            std::vector<std::shared_ptr<TaskProfile>>{failing_profile, succeeding_profile,
+                                                      succeeding_profile}));
+
+    EXPECT_FALSE(aggregate.ExecuteForTask(getpid()));
+    EXPECT_EQ(failing_action_ptr->task_executions, 1);
+    EXPECT_EQ(succeeding_action_ptr->task_executions, 2);
+}
+
+TEST(TaskProfileTest, WriteFileProcessApplicationPropagatesWriteFailure) {
+    WriteFileAction action("/no/such/task-profile-test-file", "", "<pid>", false);
+
+    EXPECT_FALSE(action.ExecuteForProcess(getuid(), getpid()));
+}
+
+TEST(TaskProfileTest, NormalSchedulerPolicyWithoutNiceHandlesFailure) {
+    SetSchedulerPolicyAction action(SCHED_OTHER);
+
+    EXPECT_FALSE(action.ExecuteForTask(-1));
+}
 
 TEST_P(TaskProfileFixture, TaskProfile) {
     // Treehugger runs host tests inside a container without cgroupv2 support.
