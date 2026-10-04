@@ -1,0 +1,340 @@
+From b43d5d9879d77d2fd0f94cdb8f35477b3d9275f2 Mon Sep 17 00:00:00 2001
+From: yehonatan5785 <yehonatan@mail.ru>
+Date: Fri, 2 Oct 2026 16:25:56 +0100
+Subject: [PATCH] libprocessgroup: harden optional memory.reclaim handling
+
+Treat a missing memory.reclaim file as an unavailable optional capability
+when the target memcg still exists, while preserving errors for missing
+cgroups and genuine write failures.
+
+Classify EINVAL only for the optional swappiness syntax, handle
+EOPNOTSUPP explicitly, and cache syntax support per CompactMemcgAction to
+avoid repeated failed probes and duplicate logs. Keep EAGAIN as the
+existing best-effort partial-reclaim result without adding teardown delay.
+
+Add host-independent coverage for missing and present reclaim files,
+full/anon/file payload generation, cached syntax support, and genuine path
+failures.
+
+Signed-off-by: yehonatan5785 <yehonatan@mail.ru>
+---
+ libprocessgroup/task_profiles.cpp      |  98 ++++++++++++++++++--
+ libprocessgroup/task_profiles.h        |   7 ++
+ libprocessgroup/task_profiles_test.cpp | 118 +++++++++++++++++++++++++
+ 3 files changed, 217 insertions(+), 6 deletions(-)
+
+diff --git a/libprocessgroup/task_profiles.cpp b/libprocessgroup/task_profiles.cpp
+index 9d9c871b1..cecc66c8e 100644
+--- a/libprocessgroup/task_profiles.cpp
++++ b/libprocessgroup/task_profiles.cpp
+@@ -20,6 +20,7 @@
+ #include <task_profiles.h>
+ 
+ #include <cinttypes>
++#include <cstring>
+ #include <map>
+ #include <string>
+ 
+@@ -720,16 +721,61 @@ bool CompactMemcgAction::GenerateReclaimString(const std::string& memory_current
+ 
+ bool CompactMemcgAction::Execute(const std::string& memory_current_path,
+                                  const std::string& memory_reclaim_path) const {
++    if (UsesOptionalSyntax() &&
++        optional_syntax_state_.load(std::memory_order_relaxed) == OptionalSyntaxState::UNSUPPORTED) {
++        errno = EOPNOTSUPP;
++        return false;
++    }
++
+     std::string reclaim_str;
+     if (!GenerateReclaimString(memory_current_path, reclaim_str)) return false;
+ 
+-    if (!WriteStringToFile(reclaim_str, memory_reclaim_path) && errno != EAGAIN) {
+-        // Reclaim of the entire memcg is likely to fail with EAGAIN. Ignore this case here.
+-        PLOG(ERROR) << "Could not write " << reclaim_str << " to " << memory_reclaim_path;
++    if (WriteStringToFile(reclaim_str, memory_reclaim_path)) {
++        if (UsesOptionalSyntax()) SetOptionalSyntaxSupported();
++        return true;
++    }
++
++    const int error = errno;
++
++    // memory.reclaim is optional. Treat a missing interface as unsupported only
++    // when memory.current proves that the target memcg itself still exists.
++    // Otherwise ENOENT describes a missing or concurrently removed cgroup and
++    // remains an actionable failure.
++    if (error == ENOENT && access(memory_current_path.c_str(), F_OK) == 0) {
++        LOG(VERBOSE) << memory_reclaim_path << " is not supported";
++        return true;
++    }
++
++    // The swappiness key is an optional extension to memory.reclaim. EINVAL is
++    // classified as an unsupported capability only for a write containing that
++    // exact syntax. The selective action still fails because no reclaim took
++    // place. A full reclaim returning EINVAL remains an error.
++    if (UsesOptionalSyntax() && (error == EINVAL || error == EOPNOTSUPP)) {
++        SetOptionalSyntaxUnsupported(error);
++        errno = error;
+         return false;
+     }
+ 
+-    return true;
++    // memory.reclaim returns EAGAIN when it could not reclaim the entire
++    // requested amount. The operation is intentionally best-effort here, so do
++    // not retry and delay cgroup teardown.
++    if (error == EAGAIN) {
++        if (UsesOptionalSyntax()) SetOptionalSyntaxSupported();
++        LOG(VERBOSE) << "Partially reclaimed memory from " << memory_reclaim_path;
++        return true;
++    }
++
++    // EOPNOTSUPP for a plain reclaim means that the optional memory.reclaim
++    // interface is present but unavailable in this kernel or cgroup
++    // configuration.
++    if (!UsesOptionalSyntax() && error == EOPNOTSUPP) {
++        LOG(VERBOSE) << memory_reclaim_path << " is not supported";
++        return true;
++    }
++
++    errno = error;
++    PLOG(ERROR) << "Could not write " << reclaim_str << " to " << memory_reclaim_path;
++    return false;
+ }
+ 
+ bool CompactMemcgAction::ExecuteForUID(uid_t uid) const {
+@@ -755,13 +801,53 @@ bool CompactMemcgAction::IsValid(const std::string& memory_reclaim_path) const {
+ 
+     // Anon-only and file-only reclaim depend on memory.reclaim swappiness support:
+     // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=68cd9050d871e4db5433420b5ceb32f5512d18bc
+-    if (type_ != CompactMemcgAction::Type::FULL) {
+-        return WriteStringToFile("0 swappiness=0", memory_reclaim_path);
++    if (UsesOptionalSyntax()) {
++        const OptionalSyntaxState state = optional_syntax_state_.load(std::memory_order_relaxed);
++        if (state != OptionalSyntaxState::UNKNOWN) {
++            return state == OptionalSyntaxState::SUPPORTED;
++        }
++
++        if (WriteStringToFile("0 swappiness=0", memory_reclaim_path)) {
++            SetOptionalSyntaxSupported();
++            return true;
++        }
++
++        const int error = errno;
++        if (error == EINVAL || error == EOPNOTSUPP) {
++            SetOptionalSyntaxUnsupported(error);
++            return false;
++        }
++        if (error == EAGAIN) {
++            SetOptionalSyntaxSupported();
++            return true;
++        }
++        // The cgroup may have disappeared after access() above. This is not
++        // evidence that the kernel lacks optional swappiness support.
++        if (error == ENOENT) return false;
++
++        errno = error;
++        PLOG(ERROR) << "Could not probe optional memory.reclaim syntax at " << memory_reclaim_path;
++        return false;
+     }
+ 
+     return true;
+ }
+ 
++void CompactMemcgAction::SetOptionalSyntaxSupported() const {
++    OptionalSyntaxState expected = OptionalSyntaxState::UNKNOWN;
++    optional_syntax_state_.compare_exchange_strong(expected, OptionalSyntaxState::SUPPORTED,
++                                                   std::memory_order_relaxed);
++}
++
++void CompactMemcgAction::SetOptionalSyntaxUnsupported(int error) const {
++    OptionalSyntaxState expected = OptionalSyntaxState::UNKNOWN;
++    if (optional_syntax_state_.compare_exchange_strong(expected, OptionalSyntaxState::UNSUPPORTED,
++                                                       std::memory_order_relaxed)) {
++        LOG(INFO) << "Optional memory.reclaim swappiness syntax is not supported: "
++                  << strerror(error);
++    }
++}
++
+ // Ensure memcgs are activated all the way down to UID cgroups
+ bool CompactMemcgAction::IsValidForUID(uid_t uid) const {
+     const std::string memory_reclaim_path =
+diff --git a/libprocessgroup/task_profiles.h b/libprocessgroup/task_profiles.h
+index 89b0f80ac..fe9d18e24 100644
+--- a/libprocessgroup/task_profiles.h
++++ b/libprocessgroup/task_profiles.h
+@@ -18,6 +18,7 @@
+ 
+ #include <sys/types.h>
+ 
++#include <atomic>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -209,15 +210,21 @@ class CompactMemcgAction : public ProfileAction {
+     bool IsValidForUID(uid_t uid) const override;
+ 
+   private:
++    enum class OptionalSyntaxState { UNKNOWN, SUPPORTED, UNSUPPORTED };
++
+     static constexpr const char* MEMORY_CURRENT_FILE = "/memory.current";
+     static constexpr const char* MEMORY_RECLAIM_FILE = "/memory.reclaim";
+     Type type_;
+     std::string cgroup_v2_root_path_;
++    mutable std::atomic<OptionalSyntaxState> optional_syntax_state_ = OptionalSyntaxState::UNKNOWN;
+ 
+     bool GenerateReclaimString(const std::string& memory_current_path, std::string& out) const;
+     bool Execute(const std::string& memory_current_path,
+                  const std::string& memory_reclaim_path) const;
+     bool IsValid(const std::string& memory_reclaim_path) const;
++    bool UsesOptionalSyntax() const { return type_ != Type::FULL; }
++    void SetOptionalSyntaxSupported() const;
++    void SetOptionalSyntaxUnsupported(int error) const;
+ };
+ 
+ class TaskProfile {
+diff --git a/libprocessgroup/task_profiles_test.cpp b/libprocessgroup/task_profiles_test.cpp
+index dff6d677e..6f5d1b54b 100644
+--- a/libprocessgroup/task_profiles_test.cpp
++++ b/libprocessgroup/task_profiles_test.cpp
+@@ -15,14 +15,17 @@
+  */
+ 
+ #include "task_profiles.h"
++#include <android-base/file.h>
+ #include <android-base/logging.h>
+ #include <android-base/strings.h>
++#include <android-base/test_utils.h>
+ #include <gtest/gtest.h>
+ #include <mntent.h>
+ #include <processgroup/processgroup.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ 
++#include <filesystem>
+ #include <fstream>
+ 
+ using ::android::base::ERROR;
+@@ -202,6 +205,121 @@ TEST_P(TaskProfileFixture, TaskProfile) {
+     EXPECT_EQ(tp2.IsValidForTask(getpid()), params.result);
+ }
+ 
++class CompactMemcgActionTest : public ::testing::Test {
++  protected:
++    void SetUp() override {
++        process_path_ = ConvertUidPidToPath(temp_dir_.path, getuid(), getpid(), true);
++        ASSERT_TRUE(std::filesystem::create_directories(process_path_));
++        current_path_ = process_path_ + "/memory.current";
++        reclaim_path_ = process_path_ + "/memory.reclaim";
++    }
++
++    void WriteCurrent(const std::string& value) {
++        ASSERT_TRUE(android::base::WriteStringToFile(value, current_path_));
++    }
++
++    void CreateReclaimFile() { ASSERT_TRUE(android::base::WriteStringToFile("", reclaim_path_)); }
++
++    TemporaryDir temp_dir_;
++    std::string process_path_;
++    std::string current_path_;
++    std::string reclaim_path_;
++};
++
++TEST_F(CompactMemcgActionTest, MissingMemoryReclaimIsInvalid) {
++    WriteCurrent("4096\n");
++    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
++
++    EXPECT_FALSE(action.IsValidForProcess(getuid(), getpid()));
++}
++
++TEST_F(CompactMemcgActionTest, MissingMemoryReclaimDegradesCleanlyAtExecution) {
++    WriteCurrent("4096\n");
++    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
++    ScopedLogCapturer captured_log;
++
++    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
++    for (const auto& log : captured_log.Log()) {
++        EXPECT_LT(log.severity, ERROR) << log.message;
++    }
++}
++
++TEST_F(CompactMemcgActionTest, FullReclaimWritesCurrentUsage) {
++    WriteCurrent("4096\n");
++    CreateReclaimFile();
++    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
++
++    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
++    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
++
++    std::string value;
++    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
++    EXPECT_EQ(value, "4096");
++}
++
++TEST_F(CompactMemcgActionTest, AnonReclaimUsesOptionalSwappinessSyntax) {
++    WriteCurrent("8192\n");
++    CreateReclaimFile();
++    CompactMemcgAction action(CompactMemcgAction::ANON, temp_dir_.path);
++
++    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
++    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
++
++    std::string value;
++    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
++    EXPECT_EQ(value, "8192 swappiness=200");
++}
++
++TEST_F(CompactMemcgActionTest, SupportedOptionalSyntaxIsNotReprobed) {
++    WriteCurrent("8192\n");
++    CreateReclaimFile();
++    CompactMemcgAction action(CompactMemcgAction::ANON, temp_dir_.path);
++
++    ASSERT_TRUE(action.IsValidForProcess(getuid(), getpid()));
++    ASSERT_TRUE(android::base::WriteStringToFile("sentinel", reclaim_path_));
++    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
++
++    std::string value;
++    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
++    EXPECT_EQ(value, "sentinel");
++}
++
++TEST_F(CompactMemcgActionTest, FileReclaimUsesOptionalSwappinessSyntax) {
++    WriteCurrent("16384\n");
++    CreateReclaimFile();
++    CompactMemcgAction action(CompactMemcgAction::FILE, temp_dir_.path);
++
++    EXPECT_TRUE(action.IsValidForProcess(getuid(), getpid()));
++    EXPECT_TRUE(action.ExecuteForProcess(getuid(), getpid()));
++
++    std::string value;
++    ASSERT_TRUE(android::base::ReadFileToString(reclaim_path_, &value));
++    EXPECT_EQ(value, "16384 swappiness=0");
++}
++
++TEST_F(CompactMemcgActionTest, MissingMemoryCurrentRemainsAnError) {
++    CreateReclaimFile();
++    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
++    ScopedLogCapturer captured_log;
++
++    EXPECT_FALSE(action.ExecuteForProcess(getuid(), getpid()));
++    ASSERT_EQ(captured_log.Log().size(), 1U);
++    EXPECT_EQ(captured_log.Log()[0].severity, ERROR);
++    EXPECT_EQ(captured_log.Log()[0].message.find("Failed to read"), 0U);
++}
++
++TEST_F(CompactMemcgActionTest, GenuineReclaimWriteFailureRemainsAnError) {
++    WriteCurrent("4096\n");
++    ASSERT_TRUE(std::filesystem::create_directory(reclaim_path_));
++    CompactMemcgAction action(CompactMemcgAction::FULL, temp_dir_.path);
++    ScopedLogCapturer captured_log;
++
++    EXPECT_FALSE(action.ExecuteForProcess(getuid(), getpid()));
++    ASSERT_EQ(captured_log.Log().size(), 1U);
++    EXPECT_EQ(captured_log.Log()[0].severity, ERROR);
++    EXPECT_EQ(captured_log.Log()[0].message.find("Could not write"), 0U);
++}
++
+ // Test the four combinations of optional_attr {false, true} and cgroup attribute { does not exist,
+ // exists }.
+ INSTANTIATE_TEST_SUITE_P(
+-- 
+2.56.0
+

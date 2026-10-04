@@ -17,10 +17,11 @@ use std::convert::TryInto;
 use std::fmt::Display;
 use std::mem::replace;
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use log::debug;
 use log::error;
@@ -33,6 +34,7 @@ use regex::Regex;
 use crate::args::ConfigFile;
 use crate::format::Record;
 use crate::format::{FileId, RecordsFile};
+use crate::tracer::page_size;
 use crate::Error;
 use crate::ReplayArgs;
 use libc::{c_void, off64_t, pread64};
@@ -57,12 +59,42 @@ impl<T: Display> Drop for ScopedLog<T> {
     }
 }
 
+fn record_metric_slice(stat_path: &Path, metrics: &[(&str, &dyn Display)]) {
+    let output: String =
+        metrics.iter().map(|(name, value)| format!("{}: {}\n", name, value)).collect();
+    if let Err(e) = std::fs::write(stat_path, output) {
+        error!("Failed to write to stat file '{}': {}", stat_path.display(), e);
+    }
+}
+
+fn record_metrics(stat_path: &Path, metrics: &ReplayMetrics, page_size_valid: bool) {
+    let prefetched_pages_metric: &dyn Display =
+        if page_size_valid { &metrics.prefetched_pages_count } else { &"unknown" };
+    let metrics: &[(&str, &dyn Display)] = &[
+        ("prefetched_records", &metrics.prefetched_records_count),
+        ("requested_bytes", &metrics.requested_bytes_count),
+        ("prefetched_bytes", &metrics.prefetched_bytes_count),
+        ("prefetched_pages", prefetched_pages_metric),
+        ("records_examined", &metrics.records_examined_count),
+        ("file_opens", &metrics.file_opens_count),
+        ("records_skipped", &metrics.records_skipped_count),
+        ("open_errors", &metrics.open_errors_count),
+        ("read_errors", &metrics.read_errors_count),
+        ("budget_exhausted", &metrics.budget_exhausted),
+        ("cancellation_reason", &metrics.cancellation_reason),
+        ("exec_time_ms", &metrics.exec_time.as_millis()),
+        ("completion_time_ns", &metrics.completion_time_ns),
+    ];
+    record_metric_slice(stat_path, metrics);
+}
+
 fn readahead(
     id: usize,
     file: Arc<File>,
     record: &Record,
     buffer: &mut [u8; READ_SZ],
-) -> Result<(), Error> {
+    state: &Mutex<SharedState>,
+) -> Result<(u64, bool), Error> {
     debug!("readahead {record:?}");
     let _dbg = scoped_log(id, "readahead");
 
@@ -75,8 +107,14 @@ fn readahead(
         .try_into()
         .map_err(|_| Error::Read { error: "Failed to convert length".to_string() })?;
 
+    let mut total_bytes_read = 0_u64;
     while remaining_data > 0 {
-        let read_size = std::cmp::min(READ_SZ, remaining_data);
+        let Some(read_size) =
+            state.lock().unwrap().reserve_read(std::cmp::min(READ_SZ, remaining_data) as u64)
+        else {
+            return Ok((total_bytes_read, false));
+        };
+        let read_size = read_size as usize;
 
         // SAFETY: This is safe because
         // - the file is known to exist and opened
@@ -96,35 +134,32 @@ fn readahead(
 
         current_offset += bytes_read as off64_t;
         remaining_data -= bytes_read as usize;
+        total_bytes_read += bytes_read as u64;
     }
 
     // TODO: Try readahead() syscall or async I/O
-    Ok(())
+    Ok((total_bytes_read, remaining_data == 0))
 }
 
 fn worker_internal(
     id: usize,
     state: Arc<Mutex<SharedState>>,
-    records_file: Arc<RwLock<RecordsFile>>,
+    records_file: Arc<RecordsFile>,
     exit_on_error: bool,
     exclude_files_regex: Vec<Regex>,
     buffer: &mut [u8],
+    page_size: Option<usize>,
 ) -> Result<(), Error> {
     loop {
-        let index = {
+        let record = {
             let mut state = state.lock().unwrap();
             if state.result.is_err() {
                 return Ok(());
             }
-            state.next_record()
-        };
-
-        let record = {
-            let rf = records_file.read().unwrap();
-            if index >= rf.inner.records.len() {
-                return Ok(());
+            match state.next_record(&records_file) {
+                Some(record) => record,
+                None => return Ok(()),
             }
-            rf.inner.records.get(index).unwrap().clone()
         };
 
         let _dbg = scoped_log(id, "record_replay");
@@ -135,29 +170,27 @@ fn worker_internal(
             Some(file) => file,
             None => {
                 let file = Arc::new({
-                    let file = records_file
-                        .read()
-                        .unwrap()
-                        .open_file(record.file_id.clone(), &exclude_files_regex);
-                    if let Err(e) = file {
-                        if exit_on_error {
-                            return Err(e);
-                        } else {
-                            match e {
+                    let file = records_file.open_file(record.file_id.clone(), &exclude_files_regex);
+                    let file = match file {
+                        Ok(file) => file,
+                        Err(e) => {
+                            let metrics = &mut state.lock().unwrap().metrics;
+                            match &e {
                                 Error::SkipPrefetch { path } => {
+                                    metrics.records_skipped_count += 1;
                                     debug!("Skipping file during replay: {path}");
                                 }
-                                _ => error!(
-                                    "Failed to open file id: {} with {}",
-                                    record.file_id.clone(),
-                                    e
-                                ),
+                                _ => {
+                                    metrics.open_errors_count += 1;
+                                    debug!("Failed to open file id: {} with {}", record.file_id, e);
+                                }
+                            }
+                            if exit_on_error {
+                                return Err(e);
                             }
                             continue;
                         }
-                    }
-
-                    let file = file.unwrap();
+                    };
                     // We do not want the filesystem be intelligent and prefetch more than what this
                     // code is reading. So turn off prefetch.
 
@@ -176,16 +209,30 @@ fn worker_internal(
                     file
                 });
                 let cache_file = file.clone();
-                state.lock().unwrap().fds.insert(record.file_id.clone(), cache_file);
+                let mut state = state.lock().unwrap();
+                state.metrics.file_opens_count += 1;
+                state.fds.insert(record.file_id.clone(), cache_file);
                 file
             }
         };
-        if let Err(e) = readahead(id, file, &record, buffer.try_into().unwrap()) {
-            if exit_on_error {
-                return Err(e);
-            } else {
-                error!("readahead failed on file id: {} with: {}", record.file_id.clone(), e);
-                continue;
+        match readahead(id, file, &record, buffer.try_into().unwrap(), &state) {
+            Err(e) => {
+                state.lock().unwrap().metrics.read_errors_count += 1;
+                if exit_on_error {
+                    return Err(e);
+                }
+                error!("readahead failed on file id: {} with: {}", record.file_id, e);
+            }
+            Ok((bytes_read, complete)) => {
+                let mut state = state.lock().unwrap();
+                let metrics = &mut state.metrics;
+                metrics.prefetched_bytes_count += bytes_read;
+                if complete {
+                    metrics.prefetched_records_count += 1;
+                }
+                if let Some(page_size) = page_size {
+                    metrics.prefetched_pages_count += bytes_read.div_ceil(page_size as u64);
+                }
             }
         }
     }
@@ -194,10 +241,11 @@ fn worker_internal(
 fn worker(
     id: usize,
     state: Arc<Mutex<SharedState>>,
-    records_file: Arc<RwLock<RecordsFile>>,
+    records_file: Arc<RecordsFile>,
     exit_on_error: bool,
     exclude_files_regex: Vec<Regex>,
     buffer: &mut [u8],
+    page_size: Option<usize>,
 ) {
     let _dbg = scoped_log(id, "read_loop");
     let result = worker_internal(
@@ -207,6 +255,7 @@ fn worker(
         exit_on_error,
         exclude_files_regex,
         buffer,
+        page_size,
     );
     if result.is_err() {
         error!("worker failed with {result:?}");
@@ -218,28 +267,107 @@ fn worker(
 }
 
 #[derive(Debug)]
+pub struct ReplayMetrics {
+    prefetched_records_count: u64,
+    requested_bytes_count: u64,
+    prefetched_bytes_count: u64,
+    prefetched_pages_count: u64,
+    records_examined_count: u64,
+    file_opens_count: u64,
+    records_skipped_count: u64,
+    open_errors_count: u64,
+    read_errors_count: u64,
+    budget_exhausted: bool,
+    cancellation_reason: &'static str,
+    exec_time: Duration,
+    completion_time_ns: u64,
+}
+
+impl Default for ReplayMetrics {
+    fn default() -> Self {
+        Self {
+            prefetched_records_count: 0,
+            requested_bytes_count: 0,
+            prefetched_bytes_count: 0,
+            prefetched_pages_count: 0,
+            records_examined_count: 0,
+            file_opens_count: 0,
+            records_skipped_count: 0,
+            open_errors_count: 0,
+            read_errors_count: 0,
+            budget_exhausted: false,
+            cancellation_reason: "none",
+            exec_time: Duration::ZERO,
+            completion_time_ns: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct SharedState {
     fds: LruCache<FileId, Arc<File>>,
     records_index: usize,
+    max_bytes: Option<u64>,
+    deadline: Option<Instant>,
     result: Result<(), Error>,
+    metrics: ReplayMetrics,
 }
 
 impl SharedState {
-    fn next_record(&mut self) -> usize {
-        let ret = self.records_index;
+    fn next_record(&mut self, records_file: &RecordsFile) -> Option<Record> {
+        if self.metrics.cancellation_reason != "none" {
+            return None;
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.cancel("duration");
+            return None;
+        }
+        let record = records_file.inner.records.get(self.records_index)?.clone();
         self.records_index += 1;
-        ret
+        self.metrics.records_examined_count += 1;
+        Some(record)
+    }
+
+    fn reserve_read(&mut self, requested: u64) -> Option<u64> {
+        if self.metrics.cancellation_reason != "none" {
+            return None;
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.cancel("duration");
+            return None;
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            let remaining = max_bytes.saturating_sub(self.metrics.requested_bytes_count);
+            if remaining == 0 {
+                self.cancel("bytes");
+                return None;
+            }
+            let reserved = requested.min(remaining);
+            self.metrics.requested_bytes_count += reserved;
+            if reserved < requested {
+                self.cancel("bytes");
+            }
+            return Some(reserved);
+        }
+        self.metrics.requested_bytes_count += requested;
+        Some(requested)
+    }
+
+    fn cancel(&mut self, reason: &'static str) {
+        self.metrics.budget_exhausted = true;
+        self.metrics.cancellation_reason = reason;
     }
 }
 
 /// Runtime, in-memory, representation of records file structure.
 #[derive(Debug)]
 pub struct Replay {
-    records_file: Arc<RwLock<RecordsFile>>,
+    records_file: Arc<RecordsFile>,
     io_depth: u16,
     exit_on_error: bool,
     state: Arc<Mutex<SharedState>>,
     exclude_files_regex: Vec<Regex>,
+    stat_path: Option<PathBuf>,
 }
 
 impl Replay {
@@ -265,27 +393,63 @@ impl Replay {
                 .map_err(|error| Error::Deserialize { error: error.to_string() })?;
 
             for file_to_exclude in &cf.files_to_exclude_regex {
-                exclude_files_regex.push(Regex::new(file_to_exclude).unwrap());
+                exclude_files_regex.push(Regex::new(file_to_exclude).map_err(|error| {
+                    Error::InvalidArgs {
+                        arg_name: "files_to_exclude_regex".to_string(),
+                        arg_value: file_to_exclude.clone(),
+                        error: error.to_string(),
+                    }
+                })?);
             }
         }
 
+        let stat_path = if args.record_metrics {
+            let stat_path = args.path.with_extension("stat");
+            File::create(&stat_path).map_err(|source| Error::Create {
+                source,
+                path: stat_path.display().to_string(),
+            })?;
+            Some(stat_path)
+        } else {
+            None
+        };
+        let deadline = if args.max_duration_ms == 0 {
+            None
+        } else {
+            Some(
+                Instant::now()
+                    .checked_add(Duration::from_millis(args.max_duration_ms))
+                    .ok_or_else(|| Error::InvalidArgs {
+                        arg_name: "max-duration-ms".to_string(),
+                        arg_value: args.max_duration_ms.to_string(),
+                        error: "duration is too large".to_string(),
+                    })?,
+            )
+        };
+
         Ok(Self {
-            records_file: Arc::new(RwLock::new(rf)),
+            records_file: Arc::new(rf),
             io_depth: args.io_depth,
             exit_on_error: args.exit_on_error,
             state: Arc::new(Mutex::new(SharedState {
                 fds: LruCache::new(args.max_fds.into()),
                 records_index: 0,
+                max_bytes: (args.max_bytes != 0).then_some(args.max_bytes),
+                deadline,
                 result: Ok(()),
+                metrics: ReplayMetrics::default(),
             })),
             exclude_files_regex,
+            stat_path,
         })
     }
 
     /// Replay records.
     pub fn replay(self) -> Result<(), Error> {
+        let start_time = Instant::now();
         let _dbg = scoped_log(1, "replay");
         let mut threads = vec![];
+        let page_size = page_size().ok();
         for i in 0..self.io_depth {
             let i_clone = i as usize;
             let state = self.state.clone();
@@ -295,21 +459,34 @@ impl Replay {
 
             let mut buffer = Box::new([0u8; READ_SZ]);
 
-            threads.push(thread::Builder::new().spawn(move || {
-                worker(
-                    i_clone,
-                    state,
-                    records_file,
-                    exit_on_error,
-                    exclude_files_regex,
-                    buffer.as_mut_slice(),
-                )
-            }));
+            threads.push(
+                thread::Builder::new()
+                    .spawn(move || {
+                        worker(
+                            i_clone,
+                            state,
+                            records_file,
+                            exit_on_error,
+                            exclude_files_regex,
+                            buffer.as_mut_slice(),
+                            page_size,
+                        )
+                    })
+                    .map_err(|e| Error::ThreadPool { error: e.to_string() })?,
+            );
         }
         for thread in threads {
-            thread.unwrap().join().unwrap();
+            thread
+                .join()
+                .map_err(|_| Error::ThreadPool { error: "replay worker panicked".to_string() })?;
         }
-        replace(&mut self.state.lock().unwrap().result, Ok(()))
+        let mut state = self.state.lock().unwrap();
+        if let Some(stat_path) = &self.stat_path {
+            state.metrics.exec_time = start_time.elapsed();
+            state.metrics.completion_time_ns = crate::nanoseconds_since_boot();
+            record_metrics(stat_path, &state.metrics, page_size.is_some());
+        }
+        replace(&mut state.result, Ok(()))
     }
 }
 
@@ -650,6 +827,12 @@ pub mod tests {
         // Here "uncached_files" emulate the files after reboot when none of those files data is in cache.
         let (mut uncached_rf, mut uncached_files, _out_files) =
             copy_uncached_files_and_record_from(Path::new(&test_base_dir), &mut files, &rf);
+        for inode in uncached_rf.inner.inode_map.values_mut() {
+            let metadata = std::fs::metadata(inode.paths.first().unwrap()).unwrap();
+            inode.inode_number = metadata.ino();
+            inode.device_number = metadata.dev();
+            inode.file_size = metadata.len();
+        }
 
         // Injects error(s) in the form of invalid filename
         if inject_error {
@@ -691,6 +874,9 @@ pub mod tests {
             max_fds: 128,
             exit_on_error,
             config_path: config_file.path().to_owned(),
+            record_metrics: false,
+            max_bytes: 0,
+            max_duration_ms: 0,
         })
         .unwrap();
 
@@ -754,5 +940,69 @@ pub mod tests {
     #[test]
     fn test_replay_empty_exclude_files_list() {
         test_replay_internal(true, false, false, false, true);
+    }
+
+    fn state_with_budget(max_bytes: Option<u64>, deadline: Option<Instant>) -> SharedState {
+        SharedState {
+            fds: LruCache::new(1),
+            records_index: 0,
+            max_bytes,
+            deadline,
+            result: Ok(()),
+            metrics: ReplayMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn replay_byte_budget_is_aggregate_and_strict() {
+        let state = Arc::new(Mutex::new(state_with_budget(Some(10), None)));
+        let reservations: Vec<_> = (0..4)
+            .map(|_| {
+                let state = state.clone();
+                thread::spawn(move || state.lock().unwrap().reserve_read(8).unwrap_or(0))
+            })
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let state = state.lock().unwrap();
+        assert_eq!(reservations.iter().sum::<u64>(), 10);
+        assert_eq!(state.metrics.requested_bytes_count, 10);
+        assert!(state.metrics.budget_exhausted);
+        assert_eq!(state.metrics.cancellation_reason, "bytes");
+    }
+
+    #[test]
+    fn replay_byte_budget_reads_partial_final_record() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[1; 16]).unwrap();
+        let state = Mutex::new(state_with_budget(Some(10), None));
+        let record = Record { file_id: FileId(0), offset: 0, length: 16, timestamp: 0 };
+        let mut buffer = Box::new([0_u8; READ_SZ]);
+        let (bytes_read, complete) =
+            readahead(0, Arc::new(file), &record, &mut buffer, &state).unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(bytes_read, 10);
+        assert!(!complete);
+        assert_eq!(state.metrics.requested_bytes_count, 10);
+        assert_eq!(state.metrics.cancellation_reason, "bytes");
+    }
+
+    #[test]
+    fn failed_or_skipped_record_does_not_consume_byte_budget() {
+        let mut rf = RecordsFile::default();
+        rf.inner.records = vec![Record { file_id: FileId(0), offset: 0, length: 8, timestamp: 0 }];
+        let mut state = state_with_budget(Some(10), None);
+        assert_eq!(state.next_record(&rf).unwrap().length, 8);
+        assert_eq!(state.metrics.requested_bytes_count, 0);
+        assert_eq!(state.metrics.cancellation_reason, "none");
+    }
+
+    #[test]
+    fn replay_duration_budget_stops_before_claiming_work() {
+        let mut rf = RecordsFile::default();
+        rf.inner.records = vec![Record { file_id: FileId(0), offset: 0, length: 8, timestamp: 0 }];
+        let mut state = state_with_budget(None, Some(Instant::now() - Duration::from_millis(1)));
+        assert!(state.next_record(&rf).is_none());
+        assert_eq!(state.metrics.records_examined_count, 0);
+        assert_eq!(state.metrics.cancellation_reason, "duration");
     }
 }

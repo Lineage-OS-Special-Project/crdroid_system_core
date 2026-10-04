@@ -364,19 +364,36 @@ impl RecordsFile {
     /// Given file id, looks up path of the file and returns open File handle.
     pub fn open_file(&self, id: FileId, exclude_files_regex: &[Regex]) -> Result<File, Error> {
         if let Some(inode) = self.inner.inode_map.get(&id) {
-            let path = inode.paths.first().unwrap();
-
-            for regex in exclude_files_regex {
-                if regex.is_match(path) {
-                    return Err(Error::SkipPrefetch { path: path.to_owned() });
+            let mut last_error = None;
+            for path in &inode.paths {
+                if exclude_files_regex.iter().any(|regex| regex.is_match(path)) {
+                    last_error = Some(Error::SkipPrefetch { path: path.to_owned() });
+                    continue;
                 }
+                debug!("Opening {} file {}", id.0, path);
+                let file = match OpenOptions::new().read(true).write(false).open(path) {
+                    Ok(file) => file,
+                    Err(source) => {
+                        last_error = Some(Error::Open { source, path: path.to_owned() });
+                        continue;
+                    }
+                };
+                let metadata = match file.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(source) => {
+                        last_error = Some(Error::Stat { source, path: path.to_owned() });
+                        continue;
+                    }
+                };
+                if metadata.ino() == inode.inode_number
+                    && metadata.dev() == inode.device_number
+                    && metadata.len() == inode.file_size
+                {
+                    return Ok(file);
+                }
+                last_error = Some(Error::StaleFile { path: path.to_owned() });
             }
-            debug!("Opening {} file {}", id.0, path);
-            OpenOptions::new()
-                .read(true)
-                .write(false)
-                .open(path)
-                .map_err(|source| Error::Open { source, path: path.to_owned() })
+            Err(last_error.unwrap_or(Error::IdNoFound { id }))
         } else {
             Err(Error::IdNoFound { id })
         }
@@ -432,6 +449,25 @@ impl RecordsFile {
             return Err(Error::StaleInode { stale_inodes, missing_paths, missing_file_ids });
         }
 
+        Ok(())
+    }
+
+    fn check_record_ranges(&self) -> Result<(), Error> {
+        for record in &self.inner.records {
+            if let Some(inode) = self.inner.inode_map.get(&record.file_id) {
+                let valid_end = record.offset.checked_add(record.length).is_some()
+                    && record.length != 0
+                    && record.offset < inode.file_size;
+                if !valid_end {
+                    return Err(Error::Custom {
+                        error: format!(
+                            "record range is outside file: id={} offset={} length={} file_size={}",
+                            record.file_id, record.offset, record.length, inode.file_size
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -539,6 +575,10 @@ impl<'de> Deserialize<'de> for RecordsFile {
                 digest, rf.header.digest
             )));
         }
+
+        rf.check_record_ranges().map_err(|e| {
+            serde::de::Error::custom(format!("failed to validate record ranges: {e}"))
+        })?;
 
         Ok(rf)
     }
@@ -817,5 +857,77 @@ pub mod tests {
                         paths: [],\n        \
                         device_number: 2,\n    },\n]"
         );
+    }
+
+    #[test]
+    fn open_file_rejects_replaced_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        std::fs::write(&path, b"same-size").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mut rf = RecordsFile::default();
+        rf.insert_or_update_inode_info(
+            FileId(0),
+            InodeInfo::new(
+                metadata.ino(),
+                metadata.len(),
+                vec![path.display().to_string()],
+                metadata.dev(),
+            ),
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"same-size").unwrap();
+
+        assert!(matches!(rf.open_file(FileId(0), &[]), Err(Error::StaleFile { .. })));
+    }
+
+    #[test]
+    fn open_file_uses_valid_alternate_path() {
+        let valid_file = tempfile::NamedTempFile::new().unwrap();
+        let stale_file = tempfile::NamedTempFile::new().unwrap();
+        let valid_path = valid_file.path().to_owned();
+        let stale_path = stale_file.path().to_owned();
+        std::fs::write(&valid_path, b"contents").unwrap();
+        std::fs::write(&stale_path, b"different").unwrap();
+        let metadata = std::fs::metadata(&valid_path).unwrap();
+        let mut rf = RecordsFile::default();
+        rf.insert_or_update_inode_info(
+            FileId(0),
+            InodeInfo::new(
+                metadata.ino(),
+                metadata.len(),
+                vec![stale_path.display().to_string(), valid_path.display().to_string()],
+                metadata.dev(),
+            ),
+        );
+
+        assert!(rf.open_file(FileId(0), &[]).is_ok());
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_record_ranges() {
+        for (offset, length, file_size) in [(0, 0, 10), (10, 1, 10), (u64::MAX - 1, 2, u64::MAX)] {
+            let mut rf = RecordsFile::default();
+            rf.insert_or_update_inode_info(
+                FileId(0),
+                InodeInfo::new(1, file_size, vec!["unused".to_string()], 1),
+            );
+            rf.insert_record(Record { file_id: FileId(0), offset, length, timestamp: 0 });
+            let serialized = rf.add_checksum_and_serialize().unwrap();
+            let result: Result<RecordsFile, _> = serde_cbor::from_slice(&serialized);
+            assert!(result.unwrap_err().to_string().contains("record range is outside file"));
+        }
+    }
+
+    #[test]
+    fn deserialize_accepts_final_range_crossing_eof() {
+        let mut rf = RecordsFile::default();
+        rf.insert_or_update_inode_info(
+            FileId(0),
+            InodeInfo::new(1, 10, vec!["unused".to_string()], 1),
+        );
+        rf.insert_record(Record { file_id: FileId(0), offset: 8, length: 4, timestamp: 0 });
+        let serialized = rf.add_checksum_and_serialize().unwrap();
+        assert!(serde_cbor::from_slice::<RecordsFile>(&serialized).is_ok());
     }
 }
