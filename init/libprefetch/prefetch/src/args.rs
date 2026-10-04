@@ -15,6 +15,9 @@
 pub(crate) static DEFAULT_IO_DEPTH: u16 = 2;
 pub(crate) static DEFAULT_MAX_FDS: u16 = 128;
 pub(crate) static DEFAULT_EXIT_ON_ERROR: bool = false;
+pub(crate) static DEFAULT_RECORD_METRICS: bool = false;
+pub(crate) static DEFAULT_MAX_BYTES: u64 = 0;
+pub(crate) static DEFAULT_MAX_DURATION_MS: u64 = 0;
 
 mod args_argh;
 use args_argh as args_internal;
@@ -59,6 +62,21 @@ fn verify_and_fix(args: &mut MainArgs) -> Result<(), Error> {
             }
         }
         SubCommands::Replay(arg) => {
+            if arg.io_depth == 0 {
+                return Err(Error::InvalidArgs {
+                    arg_name: "io-depth".to_string(),
+                    arg_value: arg.io_depth.to_string(),
+                    error: "must be greater than zero".to_string(),
+                });
+            }
+            if arg.max_fds == 0 {
+                return Err(Error::InvalidArgs {
+                    arg_name: "max-fds".to_string(),
+                    arg_value: arg.max_fds.to_string(),
+                    error: "must be greater than zero".to_string(),
+                });
+            }
+            #[cfg(not(target_os = "android"))]
             ensure_path_exists(&arg.path)?;
             if !arg.config_path.as_os_str().is_empty() {
                 ensure_path_exists(&arg.config_path)?;
@@ -106,4 +124,34 @@ pub fn args_from_env() -> MainArgs {
         exit(1);
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use argh::FromArgs;
+
+    fn parse_replay(args: &[&str]) -> Result<ReplayArgs, argh::EarlyExit> {
+        ReplayArgs::from_args(&["prefetch", "replay"], args)
+    }
+
+    #[test]
+    fn replay_limits_parse() {
+        let args = parse_replay(&["--max-bytes", "123", "--max-duration-ms", "456"]).unwrap();
+        assert_eq!(args.max_bytes, 123);
+        assert_eq!(args.max_duration_ms, 456);
+    }
+
+    #[test]
+    fn replay_limits_default_to_unlimited() {
+        let args = parse_replay(&[]).unwrap();
+        assert_eq!(args.max_bytes, 0);
+        assert_eq!(args.max_duration_ms, 0);
+    }
+
+    #[test]
+    fn replay_limits_reject_malformed_values() {
+        assert!(parse_replay(&["--max-bytes", "invalid"]).is_err());
+        assert!(parse_replay(&["--max-duration-ms", "-1"]).is_err());
+    }
 }

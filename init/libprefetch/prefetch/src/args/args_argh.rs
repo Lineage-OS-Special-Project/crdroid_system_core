@@ -20,6 +20,9 @@ use serde::Deserialize;
 use crate::args::DEFAULT_EXIT_ON_ERROR;
 use crate::args::DEFAULT_IO_DEPTH;
 use crate::args::DEFAULT_MAX_FDS;
+use crate::args::DEFAULT_MAX_BYTES;
+use crate::args::DEFAULT_MAX_DURATION_MS;
+use crate::args::DEFAULT_RECORD_METRICS;
 use crate::Error;
 
 /// prefetch-rs
@@ -256,6 +259,18 @@ pub struct ReplayArgs {
     /// file path from where the prefetch config file will be read
     #[argh(option, default = "PathBuf::new()")]
     pub config_path: PathBuf,
+
+    /// whether to write replay metrics next to the profile
+    #[argh(option, default = "DEFAULT_RECORD_METRICS")]
+    pub record_metrics: bool,
+
+    /// maximum bytes to request during replay; zero means unlimited
+    #[argh(option, long = "max-bytes", default = "DEFAULT_MAX_BYTES")]
+    pub max_bytes: u64,
+
+    /// maximum replay duration in milliseconds; zero means unlimited
+    #[argh(option, long = "max-duration-ms", default = "DEFAULT_MAX_DURATION_MS")]
+    pub max_duration_ms: u64,
 
     #[cfg(target_os = "android")]
     /// store build_finger_print to tie the pack format

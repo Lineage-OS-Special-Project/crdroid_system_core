@@ -1,0 +1,359 @@
+From 61225ab237f692c141b8771c453b6ac40c288d4d Mon Sep 17 00:00:00 2001
+From: yehonatan5785 <yehonatan@mail.ru>
+Date: Fri, 2 Oct 2026 17:15:11 +0100
+Subject: [PATCH] libprocessgroup: harden task profile execution and caching
+
+Keep task and process resource-cache state independent and synchronize cache
+enable/drop transitions because TaskProfile instances are shared across
+threads. Preserve the existing action-level FD locking and avoid caching
+dynamic application cgroup paths.
+
+Propagate failures from aggregate, UID, and process-wide WriteFile actions,
+while preserving aggregate execution order. Fix scheduler failure logging
+without an optional nice value and keep repeated cpuset ENOSPC failures from
+being misreported as success.
+
+Replace per-call regex construction for literal UID/PID path substitutions
+and add focused concurrency and failure-propagation tests. No task-profile
+policy or device-specific configuration is changed.
+
+Signed-off-by: yehonatan5785 <yehonatan@mail.ru>
+---
+ libprocessgroup/cgroup_map.cpp         |  8 +--
+ libprocessgroup/task_profiles.cpp      | 61 ++++++++++-------
+ libprocessgroup/task_profiles.h        |  5 +-
+ libprocessgroup/task_profiles_test.cpp | 90 ++++++++++++++++++++++++++
+ 4 files changed, 134 insertions(+), 30 deletions(-)
+
+diff --git a/libprocessgroup/cgroup_map.cpp b/libprocessgroup/cgroup_map.cpp
+index 32bef13a1..5d7bbbbdd 100644
+--- a/libprocessgroup/cgroup_map.cpp
++++ b/libprocessgroup/cgroup_map.cpp
+@@ -20,16 +20,16 @@
+ #include <errno.h>
+ #include <unistd.h>
+ 
+-#include <regex>
+-
+ #include <android-base/file.h>
+ #include <android-base/logging.h>
+ #include <android-base/stringprintf.h>
++#include <android-base/strings.h>
+ #include <cgroup_map.h>
+ #include <processgroup/processgroup.h>
+ #include <processgroup/util.h>
+ 
+ using android::base::StringPrintf;
++using android::base::StringReplace;
+ using android::base::WriteStringToFile;
+ 
+ static constexpr const char* CGROUP_PROCS_FILE = "/cgroup.procs";
+@@ -83,8 +83,8 @@ std::string CgroupControllerWrapper::GetProcsFilePath(const std::string& rel_pat
+                                                       pid_t pid) const {
+     std::string proc_path(path());
+     proc_path.append("/").append(rel_path);
+-    proc_path = regex_replace(proc_path, std::regex("<uid>"), std::to_string(uid));
+-    proc_path = regex_replace(proc_path, std::regex("<pid>"), std::to_string(pid));
++    proc_path = StringReplace(proc_path, "<uid>", std::to_string(uid), true);
++    proc_path = StringReplace(proc_path, "<pid>", std::to_string(pid), true);
+ 
+     return proc_path.append(CGROUP_PROCS_FILE);
+ }
+diff --git a/libprocessgroup/task_profiles.cpp b/libprocessgroup/task_profiles.cpp
+index cecc66c8e..6ae863a0d 100644
+--- a/libprocessgroup/task_profiles.cpp
++++ b/libprocessgroup/task_profiles.cpp
+@@ -337,15 +337,11 @@ bool SetCgroupAction::AddTidToCgroup(pid_t tid, int fd, ResourceCacheType cache_
+     // ENOSPC is returned when cpuset cgroup that we are joining has no online cpus
+     if (errno == ENOSPC && !strcmp(controller_name, "cpuset")) {
+         // This is an abnormal case happening only in testing, so report it only once
+-        static bool empty_cpuset_reported = false;
+-
+-        if (empty_cpuset_reported) {
+-            return true;
++        static std::atomic_bool empty_cpuset_reported = false;
++        if (!empty_cpuset_reported.exchange(true, std::memory_order_relaxed)) {
++            LOG(ERROR) << "Failed to add task '" << value
++                       << "' into cpuset because all cpus in that cpuset are offline";
+         }
+-
+-        LOG(ERROR) << "Failed to add task '" << value
+-                   << "' into cpuset because all cpus in that cpuset are offline";
+-        empty_cpuset_reported = true;
+     } else {
+         PLOG(ERROR) << "AddTidToCgroup failed to write '" << value << "'; path=" << path_ << "; "
+                     << (cache_type == RCT_TASK ? "task" : "process");
+@@ -579,15 +575,16 @@ bool WriteFileAction::ExecuteForProcess(uid_t uid, pid_t pid) const {
+     }
+ 
+     dirent* de;
++    bool success = true;
+     while ((de = readdir(d.get()))) {
+         pid_t t_pid = atoi(de->d_name);
+         if (!t_pid) {
+             continue;
+         }
+ 
+-        WriteValueToFile(value_, ProfileAction::RCT_TASK, uid, t_pid, logfailures_);
++        success &= WriteValueToFile(value_, ProfileAction::RCT_TASK, uid, t_pid, logfailures_);
+     }
+-    return true;
++    return success;
+ }
+ 
+ bool WriteFileAction::ExecuteForTask(pid_t tid) const {
+@@ -682,10 +679,11 @@ bool SetSchedulerPolicyAction::toPriority(int policy, int virtual_priority, int&
+ 
+ bool SetSchedulerPolicyAction::ExecuteForTask(pid_t tid) const {
+     struct sched_param param = {};
+-    param.sched_priority = isNormalPolicy(policy_) ? 0 : *priority_or_nice_;
++    const int priority_or_nice = priority_or_nice_.value_or(0);
++    param.sched_priority = isNormalPolicy(policy_) ? 0 : priority_or_nice;
+     if (sched_setscheduler(tid, policy_, &param) == -1) {
+         PLOG(WARNING) << "SetSchedulerPolicy: Failed to apply scheduler policy (" << policy_
+-                      << ") with priority (" << *priority_or_nice_ << ") to tid " << tid;
++                      << ") with priority (" << priority_or_nice << ") to tid " << tid;
+         return false;
+     }
+ 
+@@ -865,17 +863,19 @@ bool CompactMemcgAction::IsValidForProcess(uid_t uid, pid_t pid) const {
+ }
+ 
+ bool ApplyProfileAction::ExecuteForProcess(uid_t uid, pid_t pid) const {
++    bool success = true;
+     for (const auto& profile : profiles_) {
+-        profile->ExecuteForProcess(uid, pid);
++        success &= profile->ExecuteForProcess(uid, pid);
+     }
+-    return true;
++    return success;
+ }
+ 
+ bool ApplyProfileAction::ExecuteForTask(pid_t tid) const {
++    bool success = true;
+     for (const auto& profile : profiles_) {
+-        profile->ExecuteForTask(tid);
++        success &= profile->ExecuteForTask(tid);
+     }
+-    return true;
++    return success;
+ }
+ 
+ void ApplyProfileAction::EnableResourceCaching(ResourceCacheType cache_type) {
+@@ -910,7 +910,9 @@ bool ApplyProfileAction::IsValidForTask(pid_t tid) const {
+ 
+ void TaskProfile::MoveTo(TaskProfile* profile) {
+     profile->elements_ = std::move(elements_);
+-    profile->res_cached_ = res_cached_;
++    // Load-time overrides replace all actions. Any cache state belonged to the
++    // old actions and must not be carried over to the replacements.
++    for (bool& cached : profile->res_cached_) cached = false;
+ }
+ 
+ bool TaskProfile::ExecuteForProcess(uid_t uid, pid_t pid) const {
+@@ -947,27 +949,35 @@ bool TaskProfile::ExecuteForUID(uid_t uid) const {
+ }
+ 
+ void TaskProfile::EnableResourceCaching(ProfileAction::ResourceCacheType cache_type) {
+-    if (res_cached_) {
++    if (cache_type < ProfileAction::RCT_TASK || cache_type >= ProfileAction::RCT_COUNT) {
++        LOG(ERROR) << "Invalid cache type is specified!";
+         return;
+     }
+ 
++    std::lock_guard<std::mutex> lock(res_cache_mutex_);
++    if (res_cached_[cache_type]) return;
++
+     for (auto& element : elements_) {
+         element->EnableResourceCaching(cache_type);
+     }
+ 
+-    res_cached_ = true;
++    res_cached_[cache_type] = true;
+ }
+ 
+ void TaskProfile::DropResourceCaching(ProfileAction::ResourceCacheType cache_type) {
+-    if (!res_cached_) {
++    if (cache_type < ProfileAction::RCT_TASK || cache_type >= ProfileAction::RCT_COUNT) {
++        LOG(ERROR) << "Invalid cache type is specified!";
+         return;
+     }
+ 
++    std::lock_guard<std::mutex> lock(res_cache_mutex_);
++    if (!res_cached_[cache_type]) return;
++
+     for (auto& element : elements_) {
+         element->DropResourceCaching(cache_type);
+     }
+ 
+-    res_cached_ = false;
++    res_cached_[cache_type] = false;
+ }
+ 
+ bool TaskProfile::IsValidForProcess(uid_t uid, pid_t pid) const {
+@@ -1300,6 +1310,7 @@ const IProfileAttribute* TaskProfiles::GetAttribute(std::string_view name) const
+ 
+ template <typename T>
+ bool TaskProfiles::SetUserProfiles(uid_t uid, std::span<const T> profiles, bool use_fd_cache) {
++    bool success = true;
+     for (const auto& name : profiles) {
+         TaskProfile* profile = GetProfile(name);
+         if (profile != nullptr) {
+@@ -1307,13 +1318,15 @@ bool TaskProfiles::SetUserProfiles(uid_t uid, std::span<const T> profiles, bool
+                 profile->EnableResourceCaching(ProfileAction::RCT_PROCESS);
+             }
+             if (!profile->ExecuteForUID(uid)) {
+-                PLOG(WARNING) << "Failed to apply " << name << " process profile";
++                LOG(WARNING) << "Failed to apply " << name << " user profile";
++                success = false;
+             }
+         } else {
+-            PLOG(WARNING) << "Failed to find " << name << "process profile";
++            LOG(WARNING) << "Failed to find " << name << " user profile";
++            success = false;
+         }
+     }
+-    return true;
++    return success;
+ }
+ 
+ template <typename T>
+diff --git a/libprocessgroup/task_profiles.h b/libprocessgroup/task_profiles.h
+index fe9d18e24..d6ff7eff3 100644
+--- a/libprocessgroup/task_profiles.h
++++ b/libprocessgroup/task_profiles.h
+@@ -229,7 +229,7 @@ class CompactMemcgAction : public ProfileAction {
+ 
+ class TaskProfile {
+   public:
+-    TaskProfile(const std::string& name) : name_(name), res_cached_(false) {}
++    TaskProfile(const std::string& name) : name_(name) {}
+ 
+     const std::string& Name() const { return name_; }
+     void Add(std::unique_ptr<ProfileAction> e) { elements_.push_back(std::move(e)); }
+@@ -245,7 +245,8 @@ class TaskProfile {
+ 
+   private:
+     const std::string name_;
+-    bool res_cached_;
++    bool res_cached_[ProfileAction::RCT_COUNT] = {};
++    std::mutex res_cache_mutex_;
+     std::vector<std::unique_ptr<ProfileAction>> elements_;
+ };
+ 
+diff --git a/libprocessgroup/task_profiles_test.cpp b/libprocessgroup/task_profiles_test.cpp
+index 6f5d1b54b..119dc4d78 100644
+--- a/libprocessgroup/task_profiles_test.cpp
++++ b/libprocessgroup/task_profiles_test.cpp
+@@ -22,11 +22,13 @@
+ #include <gtest/gtest.h>
+ #include <mntent.h>
+ #include <processgroup/processgroup.h>
++#include <sched.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ 
+ #include <filesystem>
+ #include <fstream>
++#include <thread>
+ 
+ using ::android::base::ERROR;
+ using ::android::base::LogFunction;
+@@ -184,6 +186,94 @@ class TaskProfileFixture : public TestWithParam<TestParam> {
+     ~TaskProfileFixture() = default;
+ };
+ 
++class RecordingAction : public ProfileAction {
++  public:
++    explicit RecordingAction(bool result = true) : result_(result) {}
++
++    const char* Name() const override { return "Recording"; }
++    bool ExecuteForProcess(uid_t, pid_t) const override {
++        ++process_executions;
++        return result_;
++    }
++    bool ExecuteForTask(pid_t) const override {
++        ++task_executions;
++        return result_;
++    }
++    void EnableResourceCaching(ResourceCacheType cache_type) override {
++        ++cache_enables[cache_type];
++    }
++    void DropResourceCaching(ResourceCacheType cache_type) override {
++        ++cache_drops[cache_type];
++    }
++
++    mutable std::atomic<int> process_executions = 0;
++    mutable std::atomic<int> task_executions = 0;
++    std::atomic<int> cache_enables[RCT_COUNT] = {};
++    std::atomic<int> cache_drops[RCT_COUNT] = {};
++
++  private:
++    bool result_;
++};
++
++TEST(TaskProfileTest, ResourceCachesAreIndependentAndConcurrencySafe) {
++    TaskProfile profile("test_profile");
++    auto action = std::make_unique<RecordingAction>();
++    RecordingAction* action_ptr = action.get();
++    profile.Add(std::move(action));
++
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 8; ++i) {
++        threads.emplace_back([&profile]() {
++            profile.EnableResourceCaching(ProfileAction::RCT_TASK);
++            profile.EnableResourceCaching(ProfileAction::RCT_PROCESS);
++        });
++    }
++    for (auto& thread : threads) thread.join();
++
++    EXPECT_EQ(action_ptr->cache_enables[ProfileAction::RCT_TASK], 1);
++    EXPECT_EQ(action_ptr->cache_enables[ProfileAction::RCT_PROCESS], 1);
++
++    profile.DropResourceCaching(ProfileAction::RCT_TASK);
++    EXPECT_EQ(action_ptr->cache_drops[ProfileAction::RCT_TASK], 1);
++    EXPECT_EQ(action_ptr->cache_drops[ProfileAction::RCT_PROCESS], 0);
++
++    // Dropping one cache type must not prevent the other from being dropped.
++    profile.DropResourceCaching(ProfileAction::RCT_PROCESS);
++    EXPECT_EQ(action_ptr->cache_drops[ProfileAction::RCT_PROCESS], 1);
++}
++
++TEST(TaskProfileTest, AggregatePreservesOrderAndPropagatesFailure) {
++    auto failing_profile = std::make_shared<TaskProfile>("failing");
++    auto failing_action = std::make_unique<RecordingAction>(false);
++    RecordingAction* failing_action_ptr = failing_action.get();
++    failing_profile->Add(std::move(failing_action));
++
++    auto succeeding_profile = std::make_shared<TaskProfile>("succeeding");
++    auto succeeding_action = std::make_unique<RecordingAction>();
++    RecordingAction* succeeding_action_ptr = succeeding_action.get();
++    succeeding_profile->Add(std::move(succeeding_action));
++
++    TaskProfile aggregate("aggregate");
++    aggregate.Add(std::make_unique<ApplyProfileAction>(
++            std::vector<std::shared_ptr<TaskProfile>>{failing_profile, succeeding_profile}));
++
++    EXPECT_FALSE(aggregate.ExecuteForTask(getpid()));
++    EXPECT_EQ(failing_action_ptr->task_executions, 1);
++    EXPECT_EQ(succeeding_action_ptr->task_executions, 1);
++}
++
++TEST(TaskProfileTest, WriteFileProcessApplicationPropagatesWriteFailure) {
++    WriteFileAction action("/no/such/task-profile-test-file", "", "<pid>", false);
++
++    EXPECT_FALSE(action.ExecuteForProcess(getuid(), getpid()));
++}
++
++TEST(TaskProfileTest, NormalSchedulerPolicyWithoutNiceHandlesFailure) {
++    SetSchedulerPolicyAction action(SCHED_OTHER);
++
++    EXPECT_FALSE(action.ExecuteForTask(-1));
++}
++
+ TEST_P(TaskProfileFixture, TaskProfile) {
+     // Treehugger runs host tests inside a container without cgroupv2 support.
+     if (!IsCgroupV2MountedRw()) {
+-- 
+2.56.0
+

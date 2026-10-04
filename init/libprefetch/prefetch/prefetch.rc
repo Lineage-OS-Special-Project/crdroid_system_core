@@ -13,6 +13,8 @@
 #   replay is I/O intensive. make sure you pick appropriate
 #   timing to run each, so that you can maximize the page cache
 #   hit for subsequent disk access.
+#   ro.prefetch_boot.max_bytes is in bytes and
+#   ro.prefetch_boot.max_duration_ms is in milliseconds; zero/unset is unlimited.
 #
 # Example:
 #   on early-init && property:ro.prefetch_boot.enabled=true
@@ -30,7 +32,7 @@ service prefetch_record /system/bin/prefetch record --duration ${ro.prefetch_boo
     disabled
     oneshot
 
-service prefetch_replay /system/bin/prefetch replay --io-depth ${ro.prefetch_boot.io_depth:-2} --max-fds ${ro.prefetch_boot.max_fds:-1024}
+service prefetch_replay /system/bin/prefetch replay --io-depth ${ro.prefetch_boot.io_depth:-2} --max-fds ${ro.prefetch_boot.max_fds:-1024} --max-bytes ${ro.prefetch_boot.max_bytes:-0} --max-duration-ms ${ro.prefetch_boot.max_duration_ms:-0} --record-metrics true
     user root
     group root system
     disabled
@@ -42,9 +44,8 @@ service prefetch_apex_record /system/bin/prefetch record --duration ${ro.prefetc
     disabled
     oneshot
 
-service prefetch_apex_replay /system/bin/prefetch replay --io-depth ${ro.prefetch_boot.io_depth:-2} --max-fds ${ro.prefetch_boot.max_fds:-1024} --path /metadata/prefetch/prefetch_apex.pack
+service prefetch_apex_replay /system/bin/prefetch replay --io-depth ${ro.prefetch_boot.io_depth:-2} --max-fds ${ro.prefetch_boot.max_fds:-1024} --max-bytes ${ro.prefetch_boot.max_bytes:-0} --max-duration-ms ${ro.prefetch_boot.max_duration_ms:-0} --path /metadata/prefetch/prefetch_apex.pack --record-metrics true
     user root
     group root system
     disabled
     oneshot
-
