@@ -154,6 +154,8 @@ libinit_cc_defaults {
                 "-DDUMP_ON_UMOUNT_FAILURE=1",
                 "-UALLOW_REMOUNT_OVERLAYS",
                 "-DALLOW_REMOUNT_OVERLAYS=1",
+                "-USPOOF_SAFETYNET",
+                "-DSPOOF_SAFETYNET=0",
             ],
         },
         eng: {
@@ -472,6 +474,9 @@ init_first_stage_cc_defaults {
 
                 "-UDUMP_ON_UMOUNT_FAILURE",
                 "-DDUMP_ON_UMOUNT_FAILURE=1",
+
+                "-USPOOF_SAFETYNET",
+                "-DSPOOF_SAFETYNET=0",
             ],
         },
 
